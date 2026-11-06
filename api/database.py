@@ -13,6 +13,9 @@ if db_url.startswith("postgres://"):
 connect_args = {}
 if db_url.startswith("sqlite"):
     connect_args["check_same_thread"] = False
+    # If running in Vercel or container with read-only root, use /tmp
+    if os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME") or not os.access(".", os.W_OK):
+        db_url = "sqlite:////tmp/agentpay.db"
 
 engine = create_engine(
     db_url,
