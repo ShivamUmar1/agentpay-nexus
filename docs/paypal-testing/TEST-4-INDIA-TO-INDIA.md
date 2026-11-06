@@ -56,7 +56,7 @@ Test whether an India Personal PayPal Sandbox buyer can pay an India Business Pa
 
 ## 4. Checkout Error Evidence
 
-### A. Visible PayPal Error Message
+### A. Observed PayPal Error Messages
 
 The user manually navigated to the PayPal Sandbox approval URL using an India Personal Sandbox buyer account:
 
@@ -64,9 +64,17 @@ The user manually navigated to the PayPal Sandbox approval URL using an India Pe
 https://www.sandbox.paypal.com/checkoutnow?token=80E59338RP265534N
 ```
 
-PayPal immediately redirected to a generic error page displaying the following message (verbatim):
+PayPal returned error messages on checkout. **Two distinct error messages were observed** across the checkout attempt:
+
+**Error Message 1 (generic availability error):**
 
 > **"Something went wrong. Please go back to AgentPay Nexus and choose another way to pay. PayPal isn't available at this time."**
+
+**Error Message 2 (currency-specific seller restriction):**
+
+> **"We're sorry. This seller doesn't accept payments in your currency. Please return to the seller and choose another way to pay."**
+
+Both messages were displayed by PayPal's checkout UI before any buyer authorization was recorded. The second message is particularly significant: it directly names the seller's currency acceptance configuration as the rejection reason when both buyer and seller are India (`IN`) accounts attempting a USD-denominated transaction.
 
 ### B. Error Code Analysis
 
@@ -223,7 +231,7 @@ The demo generator fallback is the same mechanism that executed correctly in Tes
 
 ### Primary Finding: PayPal Prohibits Domestic India Transactions
 
-The PayPal checkout error — **"Something went wrong. Please go back to AgentPay Nexus and choose another way to pay. PayPal isn't available at this time."** — is consistent with and explained by PayPal's publicly documented and officially enforced policy:
+The two PayPal checkout error messages — **"Something went wrong. PayPal isn't available at this time."** and **"We're sorry. This seller doesn't accept payments in your currency."** — are consistent with and explained by PayPal's publicly documented and officially enforced policy:
 
 > **PayPal discontinued its domestic payment aggregator business in India effective April 1, 2021.** PayPal does not process transactions where both buyer and seller are registered in India (`IN`). This applies in both live and Sandbox environments.
 
@@ -238,6 +246,7 @@ The PayPal checkout error — **"Something went wrong. Please go back to AgentPa
 
 | Dimension | Assessment |
 | :--- | :--- |
+| **Error messages observed** | (1) *"Something went wrong. PayPal isn't available at this time."* (2) *"This seller doesn't accept payments in your currency."* |
 | **Error type** | PayPal platform-level account geographic restriction |
 | **Sub-classification** | Domestic India-to-India payment prohibition |
 | **Regulatory basis** | PayPal's operational withdrawal from India domestic payments (effective April 1, 2021), aligned with RBI regulations on payment aggregators |
