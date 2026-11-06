@@ -36,6 +36,7 @@ if db_url.startswith("sqlite"):
     if os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME") or not os.access(".", os.W_OK):
         db_url = "sqlite:////tmp/agentpay.db"
 else:
+    primary_connect_args["prepare_threshold"] = None
     primary_engine_kwargs.update({
         "pool_size": 5,
         "max_overflow": 10,
@@ -70,7 +71,7 @@ Base = declarative_base()
 
 
 def get_active_session() -> Session:
-    """Returns a session, falling back to SQLite if primary PostgreSQL is unreachable."""
+    """Returns a session. In production, strictly requires PostgreSQL and refuses SQLite fallback."""
     if not str(engine.url).startswith("sqlite"):
         try:
             # Test quick connection ping
@@ -78,8 +79,15 @@ def get_active_session() -> Session:
                 conn.execute(text("SELECT 1"))
             return SessionLocal()
         except (OperationalError, DatabaseError, Exception) as e:
-            logger.warning(f"Primary PostgreSQL engine unavailable ({e}). Using local fallback engine.")
+            # Disable SQLite fallback for production
+            if settings.APP_ENV == "production" or os.environ.get("VERCEL"):
+                logger.error(f"PostgreSQL connection failed in production: {e}")
+                raise RuntimeError(f"Database connection error: PostgreSQL is unreachable in production: {e}")
+            logger.warning(f"Primary PostgreSQL engine unavailable ({e}). Using local fallback engine in development.")
             return FallbackSessionLocal()
+    elif settings.APP_ENV == "production" or os.environ.get("VERCEL"):
+        # In production, if DATABASE_URL was left as sqlite, warn/raise
+        logger.warning("Running on SQLite in production is not recommended for persistence.")
     return SessionLocal()
 
 
@@ -107,7 +115,7 @@ def get_db_context() -> Generator[Session, None, None]:
 
 
 def init_db():
-    """Initializes database tables and seeds default marketplace agents on primary and fallback engines."""
+    """Initializes database tables and seeds default marketplace agents on primary engine."""
     from api.seed_data import seed_marketplace_agents
     
     # Try primary engine
@@ -117,6 +125,9 @@ def init_db():
             seed_marketplace_agents(db)
         logger.info("Database initialized successfully on primary engine.")
     except Exception as e:
+        if settings.APP_ENV == "production" or os.environ.get("VERCEL"):
+            logger.error(f"Primary engine init_db failed in production: {e}")
+            raise RuntimeError(f"PostgreSQL initialization failed in production: {e}")
         logger.warning(f"Primary engine init_db failed: {e}. Initializing fallback engine.")
         Base.metadata.create_all(bind=fallback_engine)
         with FallbackSessionLocal() as db:
