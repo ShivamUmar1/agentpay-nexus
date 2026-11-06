@@ -106,10 +106,10 @@ The platform implements the official **PayPal REST APIs (v2/checkout/orders)**:
 
 - **Frontend**: React 18, Vite, TypeScript, Tailwind CSS, Lucide Icons, Recharts, React Router v6, TanStack Query.
 - **Backend**: Python 3.12, FastAPI, Pydantic v2, Pydantic-Settings, HTTPX, SQLAlchemy 2.0.
-- **AI Orchestration**: Gemini API (preferred provider), OpenAI Adapter, and Deterministic Intelligence Engine for instant offline testability.
-- **Database**: Supabase PostgreSQL / SQLAlchemy (with local SQLite fallback for testing).
-- **Payment Gateway**: PayPal Orders v2 REST APIs (Sandbox & Live).
-- **Deployment**: Vercel Serverless Functions + GitHub repository.
+- **AI Orchestration**: Google Gemini API (`gemini-2.0-flash` with native `responseMimeType: "application/json"` and `system_instruction`), OpenAI Adapter, and Deterministic Intelligence Engine for instant offline testability.
+- **Database**: Supabase PostgreSQL / SQLAlchemy with serverless connection pooling (with local SQLite fallback for testing).
+- **Payment Gateway**: PayPal Orders v2 REST APIs (Sandbox & Live) with OAuth2 token caching and cryptographic server capture verification.
+- **Deployment**: Vercel Serverless Functions + GitHub repository CI/CD.
 
 ---
 
