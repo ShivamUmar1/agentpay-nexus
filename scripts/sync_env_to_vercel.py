@@ -67,3 +67,4 @@ if __name__ == "__main__":
         print("Please configure your keys in .env, then re-run this script.")
         sys.exit(1)
     sync_to_vercel(env_vars)
+

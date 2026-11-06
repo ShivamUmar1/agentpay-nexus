@@ -6,12 +6,14 @@ from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from api.config import settings
 
-# Adjust URL if needed (e.g. postgres:// to postgresql://)
+# Adjust URL if needed (e.g. postgres:// or postgresql:// to postgresql+psycopg://)
 db_url = settings.DATABASE_URL.strip() if settings.DATABASE_URL else ""
 if not db_url:
     db_url = "sqlite:///./agentpay.db"
 elif db_url.startswith("postgres://"):
-    db_url = db_url.replace("postgres://", "postgresql://", 1)
+    db_url = db_url.replace("postgres://", "postgresql+psycopg://", 1)
+elif db_url.startswith("postgresql://") and not db_url.startswith("postgresql+"):
+    db_url = db_url.replace("postgresql://", "postgresql+psycopg://", 1)
 
 connect_args = {}
 engine_kwargs: Dict[str, Any] = {
@@ -76,10 +78,14 @@ def get_db_context() -> Generator[Session, None, None]:
 
 def init_db():
     """Initializes database tables and seeds default marketplace agents if missing."""
-    Base.metadata.create_all(bind=engine)
-    from api.seed_data import seed_marketplace_agents
-    with get_db_context() as db:
-        seed_marketplace_agents(db)
+    try:
+        Base.metadata.create_all(bind=engine)
+        from api.seed_data import seed_marketplace_agents
+        with get_db_context() as db:
+            seed_marketplace_agents(db)
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"init_db connection notice: {e}")
 
 
 def test_db_connection() -> Dict[str, Any]:

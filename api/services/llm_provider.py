@@ -181,10 +181,17 @@ class LLMProvider:
         model = self.gemini_model if provider == "gemini" else self.openai_model
         t0 = time.time()
         try:
-            res = await self.generate_text(
-                "Respond with the word 'OK' only.",
-                system_instruction="You are a health check probe. Output 'OK' only."
-            )
+            if provider == "gemini":
+                res = await self._call_gemini("Respond with 'OK' only.", system_instruction="Output 'OK' only.")
+            elif provider == "openai":
+                res = await self._call_openai("Respond with 'OK' only.", system_instruction="Output 'OK' only.")
+            else:
+                return {
+                    "status": "demo_fallback",
+                    "provider": "deterministic_fallback",
+                    "model": "deterministic_engine_v1",
+                    "message": "No external AI credentials configured; using deterministic fallback engine."
+                }
             latency = round((time.time() - t0) * 1000, 1)
             return {
                 "status": "connected",
