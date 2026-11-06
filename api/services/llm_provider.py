@@ -101,8 +101,12 @@ class LLMProvider:
         if not key:
             raise ValueError("GEMINI_API_KEY is not configured.")
 
-        model = self.gemini_model
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        primary_model = self.gemini_model
+        # Build candidate fallback models list
+        candidate_models = [primary_model]
+        for fallback in ["gemini-3.8-flash", "gemini-3-flash-preview", "gemini-flash-latest"]:
+            if fallback not in candidate_models:
+                candidate_models.append(fallback)
         
         contents = [
             {"role": "user", "parts": [{"text": prompt}]}
@@ -124,24 +128,39 @@ class LLMProvider:
         if as_json:
             payload["generationConfig"]["responseMimeType"] = "application/json"
 
-        async with httpx.AsyncClient(timeout=35.0) as client:
-            try:
-                response = await client.post(url, json=payload)
-                if response.status_code == 404 and model != "gemini-1.5-flash":
-                    fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
-                    logger.warning(f"Model {model} returned 404; retrying with gemini-1.5-flash")
-                    response = await client.post(fallback_url, json=payload)
+        last_error = None
+        async with httpx.AsyncClient() as client:
+            for model in candidate_models:
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+                timeout_val = 15.0 if model == "gemini-3.8-flash" else 25.0
+                try:
+                    response = await client.post(url, json=payload, timeout=timeout_val)
+                    if response.status_code in [404, 503, 429]:
+                        logger.warning(f"Gemini model {model} returned HTTP {response.status_code}; cascading to next model...")
+                        last_error = f"HTTP {response.status_code}: {response.text[:200]}"
+                        continue
+                    response.raise_for_status()
+                    data = response.json()
+                    candidates = data.get("candidates", [])
+                    if candidates and "content" in candidates[0]:
+                        parts = candidates[0]["content"].get("parts", [])
+                        if parts and "text" in parts[0]:
+                            return parts[0]["text"]
+                    raise ValueError(f"Unexpected response structure from Gemini: {data}")
+                except (httpx.TimeoutException, httpx.ConnectTimeout):
+                    logger.warning(f"Gemini model {model} timed out; cascading to next model...")
+                    last_error = f"Model {model} timed out"
+                    continue
+                except httpx.HTTPStatusError as e:
+                    last_error = f"Gemini API HTTP Error {e.response.status_code}: {e.response.text}"
+                    logger.error(last_error)
+                    continue
+                except Exception as e:
+                    last_error = str(e)
+                    logger.error(f"Gemini execution error on {model}: {e}")
+                    continue
 
-                response.raise_for_status()
-                data = response.json()
-                return data["candidates"][0]["content"]["parts"][0]["text"]
-            except httpx.HTTPStatusError as e:
-                err_text = e.response.text
-                logger.error(f"Gemini API HTTP Error {e.response.status_code}: {err_text}")
-                raise RuntimeError(f"Gemini API HTTP {e.response.status_code}: {err_text}")
-            except Exception as e:
-                logger.error(f"Gemini network or execution error: {e}")
-                raise
+        raise RuntimeError(f"All Gemini models exhausted. Last error: {last_error}")
 
     async def _call_openai(self, prompt: str, system_instruction: Optional[str] = None) -> str:
         url = "https://api.openai.com/v1/chat/completions"
