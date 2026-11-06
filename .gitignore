@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+venv/
+.venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environment and sensitive keys
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+
+# Build outputs
+dist/
+dist-ssr/
+build/
+*.egg-info/
+.eggs/
+
+# Database files
+*.db
+*.sqlite
+*.sqlite3
+agentpay.db
+
+# Testing and caches
+.pytest_cache/
+.coverage
+htmlcov/
+.turbo/
+.vercel/
+
+# OS files
+.DS_Store
+Thumbs.db

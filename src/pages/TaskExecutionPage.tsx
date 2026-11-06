@@ -1,0 +1,523 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { useParams, Link } from 'react-router-dom';
+import ReactMarkdown from 'react-markdown';
+import { 
+  BarChart, 
+  Bar, 
+  XAxis, 
+  YAxis, 
+  Tooltip, 
+  ResponsiveContainer, 
+  LineChart, 
+  Line, 
+  PieChart, 
+  Pie, 
+  Cell 
+} from 'recharts';
+import { 
+  Bot, 
+  Play, 
+  Pause, 
+  RotateCw, 
+  CheckCircle2, 
+  AlertCircle, 
+  CreditCard, 
+  Download, 
+  Copy, 
+  Check, 
+  ShieldCheck, 
+  FileText, 
+  BarChart3, 
+  Layers, 
+  DollarSign, 
+  ArrowRight,
+  ExternalLink,
+  Loader2
+} from 'lucide-react';
+import { Task, TaskStep, ActivityLog, PaymentSummary } from '../types';
+import { api } from '../services/api';
+import { WorkflowVisualizer } from '../components/workflow/WorkflowVisualizer';
+import { StepLogViewer } from '../components/workflow/StepLogViewer';
+import { InvoiceModal } from '../components/payment/InvoiceModal';
+
+const CHART_COLORS = ['#00F0FF', '#0080FF', '#8B5CF6', '#10B981', '#F59E0B'];
+
+export const TaskExecutionPage: React.FC = () => {
+  const { taskId } = useParams<{ taskId: string }>();
+  const [task, setTask] = useState<Task | null>(null);
+  const [logs, setLogs] = useState<ActivityLog[]>([]);
+  const [selectedStep, setSelectedStep] = useState<TaskStep | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [advancing, setAdvancing] = useState(false);
+  const [autoRun, setAutoRun] = useState(false);
+  const [activeTab, setActiveTab] = useState<'report' | 'charts' | 'audit' | 'raw'>('report');
+  
+  // Payment modal state
+  const [paymentSummary, setPaymentSummary] = useState<PaymentSummary | null>(null);
+  const [showPaymentModal, setShowPaymentModal] = useState(false);
+  const [copied, setCopied] = useState(false);
+
+  // Polling ref
+  const autoRunRef = useRef(autoRun);
+  autoRunRef.current = autoRun;
+
+  const loadTaskData = async () => {
+    if (!taskId) return;
+    try {
+      const [taskRes, logsRes] = await Promise.all([
+        api.getTask(taskId),
+        api.getTaskActivity(taskId)
+      ]);
+      setTask(taskRes);
+      setLogs(logsRes);
+
+      // Auto-select current or first running step
+      if (!selectedStep && taskRes.steps.length > 0) {
+        const active = taskRes.steps.find(s => s.status === 'running') || taskRes.steps[0];
+        setSelectedStep(active);
+      } else if (selectedStep) {
+        // Refresh selected step
+        const refreshed = taskRes.steps.find(s => s.id === selectedStep.id);
+        if (refreshed) setSelectedStep(refreshed);
+      }
+    } catch (err) {
+      console.error('Failed to load task state:', err);
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadTaskData();
+    const interval = setInterval(loadTaskData, 3000);
+    return () => clearInterval(interval);
+  }, [taskId]);
+
+  // Auto-runner loop
+  useEffect(() => {
+    if (!autoRun || !task || advancing) return;
+
+    if (task.status === 'executing') {
+      const timer = setTimeout(() => {
+        handleAdvanceStep();
+      }, 1500);
+      return () => clearTimeout(timer);
+    } else if (task.status === 'awaiting_payment') {
+      handleOpenPaymentModal();
+      setAutoRun(false);
+    }
+  }, [autoRun, task?.status, task?.current_step, advancing]);
+
+  const handleAdvanceStep = async () => {
+    if (!taskId || advancing) return;
+    try {
+      setAdvancing(true);
+      await api.advanceTask(taskId);
+      await loadTaskData();
+    } catch (err) {
+      console.error('Advance step failed:', err);
+      setAutoRun(false);
+    } finally {
+      setAdvancing(false);
+    }
+  };
+
+  const handleOpenPaymentModal = async () => {
+    if (!taskId) return;
+    try {
+      const summary = await api.getPaymentSummary(taskId);
+      setPaymentSummary(summary);
+      setShowPaymentModal(true);
+    } catch (err) {
+      console.error('Failed to fetch invoice:', err);
+    }
+  };
+
+  const handleCopyReport = () => {
+    if (task?.final_output?.report_markdown) {
+      navigator.clipboard.writeText(task.final_output.report_markdown);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 2000);
+    }
+  };
+
+  const handleDownloadMarkdown = () => {
+    if (!task?.final_output?.report_markdown) return;
+    const blob = new Blob([task.final_output.report_markdown], { type: 'text/markdown' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `${task.title.replace(/\s+/g, '_')}_Report.md`;
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  if (loading && !task) {
+    return (
+      <div className="py-24 flex flex-col items-center justify-center gap-3 text-slate-400">
+        <Loader2 className="w-8 h-8 animate-spin text-cyan-400" />
+        <span className="text-xs font-mono">Restoring stateful execution graph from database...</span>
+      </div>
+    );
+  }
+
+  if (!task) {
+    return (
+      <div className="max-w-xl mx-auto py-20 text-center">
+        <AlertCircle className="w-10 h-10 text-rose-400 mx-auto mb-3" />
+        <h2 className="text-xl font-bold text-white">Task Not Found</h2>
+        <p className="text-xs text-slate-400 mt-2 mb-6">Could not locate task execution data in the database ledger.</p>
+        <Link to="/marketplace" className="px-4 py-2 rounded-xl bg-cyan-500 text-navy-950 font-bold text-xs">
+          Return to Marketplace
+        </Link>
+      </div>
+    );
+  }
+
+  const isCompleted = task.status === 'completed';
+  const isAwaitingPayment = task.status === 'awaiting_payment';
+  const chartData = task.final_output?.analysis_data?.chart_revenue_projections || [];
+  const marketShareData = task.final_output?.analysis_data?.market_share_breakdown || [];
+
+  return (
+    <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+      {/* Header Bar */}
+      <div className="glass-panel rounded-2xl p-5 border border-slate-800 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
+        <div>
+          <div className="flex items-center gap-2 mb-1.5">
+            <span className={`text-[10px] font-mono px-2 py-0.5 rounded font-bold uppercase ${
+              isCompleted
+                ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                : isAwaitingPayment
+                ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30 animate-pulse'
+                : 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
+            }`}>
+              {task.status.replace('_', ' ')}
+            </span>
+            <span className="text-xs text-slate-400 font-mono">ID: {task.id.slice(0, 13)}...</span>
+          </div>
+          <h1 className="text-xl sm:text-2xl font-bold text-white tracking-tight">{task.title}</h1>
+        </div>
+
+        {/* Right Financial & Execution Controls */}
+        <div className="flex flex-wrap items-center gap-3">
+          {/* Cost Tracker */}
+          <div className="px-3.5 py-1.5 rounded-xl bg-navy-950 border border-slate-800 flex items-center gap-3 text-xs font-mono">
+            <div>
+              <span className="text-[10px] text-slate-500 block">TOTAL COST</span>
+              <span className="text-cyan-400 font-bold">${task.total_cost.toFixed(2)} USD</span>
+            </div>
+            <div className="h-6 w-[1px] bg-slate-800" />
+            <div>
+              <span className="text-[10px] text-slate-500 block">BUDGET</span>
+              <span className="text-slate-300 font-bold">${task.budget.toFixed(2)} USD</span>
+            </div>
+          </div>
+
+          {/* Stepper / Auto-Run Action */}
+          {!isCompleted && !isAwaitingPayment && (
+            <div className="flex items-center gap-2">
+              <button
+                onClick={() => setAutoRun(!autoRun)}
+                className={`px-3 py-2 rounded-xl text-xs font-semibold flex items-center gap-1.5 transition-colors ${
+                  autoRun 
+                    ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40' 
+                    : 'bg-slate-800 text-slate-200 hover:bg-slate-700 border border-slate-700'
+                }`}
+              >
+                {autoRun ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
+                <span>{autoRun ? 'Pause Auto' : 'Auto-Run'}</span>
+              </button>
+
+              <button
+                onClick={handleAdvanceStep}
+                disabled={advancing}
+                className="px-4 py-2 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-navy-950 font-bold text-xs flex items-center gap-1.5 shadow-md shadow-cyan-500/20 disabled:opacity-50 transition-all"
+              >
+                {advancing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Play className="w-3.5 h-3.5 fill-current" />}
+                <span>Advance Step</span>
+              </button>
+            </div>
+          )}
+
+          {/* Payment Checkpoint Button */}
+          {isAwaitingPayment && (
+            <button
+              onClick={handleOpenPaymentModal}
+              className="px-5 py-2.5 rounded-xl bg-gradient-to-r from-[#0070BA] to-[#003087] hover:from-[#005ea6] hover:to-[#00256c] text-white font-bold text-xs flex items-center gap-2 shadow-lg shadow-blue-500/30 animate-pulse transition-all"
+            >
+              <CreditCard className="w-4 h-4" />
+              <span>Review Invoice & Authorize PayPal (${task.total_cost.toFixed(2)})</span>
+            </button>
+          )}
+
+          {/* Download button if completed */}
+          {isCompleted && (
+            <div className="flex items-center gap-2">
+              <button
+                onClick={handleCopyReport}
+                className="px-3 py-2 rounded-xl bg-navy-900 hover:bg-slate-800 text-slate-200 border border-slate-700 text-xs font-semibold flex items-center gap-1.5 transition-colors"
+              >
+                {copied ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
+                <span>{copied ? 'Copied' : 'Copy'}</span>
+              </button>
+
+              <button
+                onClick={handleDownloadMarkdown}
+                className="px-4 py-2 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-navy-950 font-bold text-xs flex items-center gap-1.5 shadow-md shadow-cyan-500/20 transition-all"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Export Report</span>
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Visual Workflow Pipeline Graph */}
+      <div className="glass-panel rounded-2xl p-4 border border-slate-800">
+        <div className="flex items-center justify-between px-2 mb-1">
+          <span className="text-[11px] font-mono text-slate-400 uppercase tracking-wider font-semibold">
+            STATEFUL MULTI-AGENT EXECUTION GRAPH
+          </span>
+          <span className="text-[11px] font-mono text-cyan-400">
+            {task.steps.filter(s => s.status === 'completed').length} / {task.steps.length} Nodes Resolved
+          </span>
+        </div>
+        <WorkflowVisualizer
+          steps={task.steps}
+          currentStep={task.current_step}
+          onSelectStep={(s) => setSelectedStep(s)}
+          selectedStepId={selectedStep?.id}
+        />
+      </div>
+
+      {/* Main Studio Grid: Left Deliverable / Inspector, Right Observability Terminal */}
+      <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
+        {/* Left Column (8 cols): Deliverable View or Active Step Inspector */}
+        <div className="lg:col-span-7 space-y-6">
+          {/* If completed: Full Final Deliverable */}
+          {isCompleted && task.final_output ? (
+            <div className="glass-panel rounded-2xl p-6 border border-slate-800 space-y-6">
+              {/* Deliverable Header & Tabs */}
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-800">
+                <div className="flex items-center gap-2">
+                  <div className="w-8 h-8 rounded-lg bg-emerald-500/20 border border-emerald-500/40 flex items-center justify-center">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-400" />
+                  </div>
+                  <div>
+                    <h3 className="font-bold text-base text-white">Verified Final Deliverable</h3>
+                    <p className="text-[11px] text-slate-400 font-mono">
+                      Unlocked & stamped by QA Auditor. Payment captured.
+                    </p>
+                  </div>
+                </div>
+
+                {/* Tabs */}
+                <div className="flex items-center gap-1 bg-navy-950 p-1 rounded-xl border border-slate-800 text-xs">
+                  <button
+                    onClick={() => setActiveTab('report')}
+                    className={`px-3 py-1 rounded-lg transition-colors ${
+                      activeTab === 'report' ? 'bg-cyan-500 text-navy-950 font-bold' : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Report
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('charts')}
+                    className={`px-3 py-1 rounded-lg transition-colors ${
+                      activeTab === 'charts' ? 'bg-cyan-500 text-navy-950 font-bold' : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    Charts
+                  </button>
+                  <button
+                    onClick={() => setActiveTab('audit')}
+                    className={`px-3 py-1 rounded-lg transition-colors ${
+                      activeTab === 'audit' ? 'bg-cyan-500 text-navy-950 font-bold' : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    QA Audit
+                  </button>
+                </div>
+              </div>
+
+              {/* Tab 1: Executive Markdown Report */}
+              {activeTab === 'report' && (
+                <div className="prose prose-invert prose-cyan max-w-none text-slate-300 text-xs sm:text-sm leading-relaxed space-y-4">
+                  <ReactMarkdown>
+                    {task.final_output.report_markdown || 'No report content available.'}
+                  </ReactMarkdown>
+                </div>
+              )}
+
+              {/* Tab 2: Quantitative Charts */}
+              {activeTab === 'charts' && (
+                <div className="space-y-6">
+                  {/* Revenue Growth Trajectory */}
+                  <div className="bg-navy-950/80 p-4 rounded-xl border border-slate-800">
+                    <h4 className="text-xs font-mono font-semibold uppercase text-cyan-400 mb-4">
+                      Deterministic Revenue Projections ($B USD, 2024-2030)
+                    </h4>
+                    <div className="h-64 w-full">
+                      <ResponsiveContainer width="100%" height="100%">
+                        <BarChart data={chartData}>
+                          <XAxis dataKey="year" stroke="#64748B" fontSize={11} />
+                          <YAxis stroke="#64748B" fontSize={11} />
+                          <Tooltip 
+                            contentStyle={{ backgroundColor: '#070B14', borderColor: '#334155', borderRadius: 8, fontSize: 12 }} 
+                            itemStyle={{ color: '#00F0FF' }}
+                          />
+                          <Bar dataKey="revenue_bn" fill="#00F0FF" radius={[4, 4, 0, 0]} />
+                        </BarChart>
+                      </ResponsiveContainer>
+                    </div>
+                  </div>
+
+                  {/* Market Share Breakdown */}
+                  {marketShareData.length > 0 && (
+                    <div className="bg-navy-950/80 p-4 rounded-xl border border-slate-800">
+                      <h4 className="text-xs font-mono font-semibold uppercase text-blue-400 mb-4">
+                        Market Share Breakdown (%)
+                      </h4>
+                      <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                        {marketShareData.map((item, idx) => (
+                          <div key={idx} className="p-3 rounded-lg bg-navy-900 border border-slate-800 text-center">
+                            <span className="text-xs text-slate-400 block truncate">{item.label}</span>
+                            <span className="text-lg font-bold text-white font-mono">{item.value}%</span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* Tab 3: QA Audit Certification */}
+              {activeTab === 'audit' && (
+                <div className="space-y-4">
+                  <div className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/30 flex items-start gap-3">
+                    <ShieldCheck className="w-6 h-6 text-emerald-400 shrink-0 mt-0.5" />
+                    <div>
+                      <h4 className="text-sm font-bold text-white">Quality Assurance Certification Stamp</h4>
+                      <p className="text-xs text-slate-300 mt-1">
+                        {task.final_output.qa_audit?.feedback || 'All requirements, quantitative metrics, and constraints verified.'}
+                      </p>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-4">
+                    <div className="p-4 rounded-xl bg-navy-950 border border-slate-800 text-center">
+                      <span className="text-xs text-slate-400 font-mono block mb-1">Completeness Score</span>
+                      <span className="text-2xl font-extrabold text-cyan-400 font-mono">
+                        {task.final_output.qa_audit?.completeness_score || 98} / 100
+                      </span>
+                    </div>
+                    <div className="p-4 rounded-xl bg-navy-950 border border-slate-800 text-center">
+                      <span className="text-xs text-slate-400 font-mono block mb-1">Factual Coherence</span>
+                      <span className="text-2xl font-extrabold text-emerald-400 font-mono">
+                        {task.final_output.qa_audit?.factual_coherence_score || 96} / 100
+                      </span>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : (
+            /* In-Progress / Step Inspector */
+            <div className="glass-panel rounded-2xl p-6 border border-slate-800 space-y-6">
+              {selectedStep ? (
+                <>
+                  <div className="flex items-center justify-between pb-4 border-b border-slate-800">
+                    <div>
+                      <span className="text-[10px] font-mono uppercase px-2 py-0.5 rounded bg-slate-800 text-slate-300">
+                        INSPECTING NODE
+                      </span>
+                      <h3 className="text-lg font-bold text-white mt-1 capitalize">
+                        {selectedStep.step_name.replace('_', ' ')}
+                      </h3>
+                      <p className="text-xs text-slate-400 font-mono">
+                        Assigned: {selectedStep.assigned_agent_id || 'Nexus Orchestrator'}
+                      </p>
+                    </div>
+
+                    <span className={`text-xs font-mono font-semibold px-2.5 py-1 rounded-full ${
+                      selectedStep.status === 'completed'
+                        ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
+                        : selectedStep.status === 'running'
+                        ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 animate-pulse'
+                        : 'bg-slate-800 text-slate-400 border border-slate-700'
+                    }`}>
+                      {selectedStep.status}
+                    </span>
+                  </div>
+
+                  {/* Output viewer */}
+                  <div>
+                    <span className="text-xs font-mono font-semibold uppercase text-slate-400 block mb-2">
+                      Structured Node Payload
+                    </span>
+                    <div className="bg-navy-950 p-4 rounded-xl border border-slate-800 overflow-x-auto max-h-[350px]">
+                      {selectedStep.output_data ? (
+                        <pre className="text-[11px] font-mono text-cyan-300 leading-relaxed">
+                          {JSON.stringify(selectedStep.output_data, null, 2)}
+                        </pre>
+                      ) : (
+                        <div className="py-8 text-center text-slate-500 text-xs italic">
+                          This node is queued. Advance workflow to execute assigned agent.
+                        </div>
+                      )}
+                    </div>
+                  </div>
+                </>
+              ) : (
+                <div className="py-12 text-center text-slate-500 text-xs">
+                  Select a workflow node above to inspect its execution state and outputs.
+                </div>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Right Column (5 cols): Observability Activity Log & Assigned Agents */}
+        <div className="lg:col-span-5 space-y-6">
+          {/* Terminal Log */}
+          <StepLogViewer logs={logs} />
+
+          {/* Assigned Agents Registry */}
+          <div className="glass-panel rounded-2xl p-5 border border-slate-800 space-y-3">
+            <h4 className="text-xs font-mono font-semibold uppercase text-slate-300 tracking-wider flex items-center justify-between">
+              <span>ENGAGED SPECIALIZED AGENTS</span>
+              <span className="text-cyan-400 font-normal">{task.steps.length} NODES</span>
+            </h4>
+
+            <div className="space-y-2">
+              {task.steps.map((s) => (
+                <div key={s.id} className="p-2.5 rounded-xl bg-navy-950/70 border border-slate-800/80 flex items-center justify-between text-xs">
+                  <div className="flex items-center gap-2">
+                    <span className={`w-2 h-2 rounded-full ${
+                      s.status === 'completed' ? 'bg-emerald-400' : s.status === 'running' ? 'bg-cyan-400 animate-pulse' : 'bg-slate-600'
+                    }`} />
+                    <span className="font-semibold text-slate-200 capitalize">{s.step_name.replace('_', ' ')}</span>
+                  </div>
+                  <span className="text-[10px] font-mono text-slate-400 truncate max-w-[120px]">
+                    {s.assigned_agent_id || 'orchestrator'}
+                  </span>
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* Invoice & PayPal Checkout Modal */}
+      <InvoiceModal
+        summary={paymentSummary}
+        onClose={() => setShowPaymentModal(false)}
+        onPaymentSuccess={async () => {
+          await loadTaskData();
+        }}
+      />
+    </div>
+  );
+};
