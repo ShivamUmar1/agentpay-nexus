@@ -51,6 +51,8 @@ class PaymentSummary(BaseModel):
 
 class OrderCreateRequest(BaseModel):
     task_id: str
+    return_url: Optional[str] = None
+    cancel_url: Optional[str] = None
 
 
 class OrderCreateResponse(BaseModel):

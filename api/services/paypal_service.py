@@ -91,7 +91,9 @@ class PayPalService:
         task_title: str,
         amount: float,
         currency: str = "USD",
-        items: Optional[list] = None
+        items: Optional[list] = None,
+        return_url: Optional[str] = None,
+        cancel_url: Optional[str] = None
     ) -> Dict[str, Any]:
         """Creates a PayPal order via Orders v2 API, or generates a verified simulated demo order."""
         if not self.is_configured:
@@ -151,7 +153,9 @@ class PayPalService:
             "application_context": {
                 "brand_name": "AgentPay Nexus",
                 "landing_page": "NO_PREFERENCE",
-                "user_action": "PAY_NOW"
+                "user_action": "PAY_NOW",
+                "return_url": return_url or f"{settings.APP_BASE_URL}/tasks/{task_id}?approved=true",
+                "cancel_url": cancel_url or f"{settings.APP_BASE_URL}/tasks/{task_id}?cancelled=true"
             }
         }
 

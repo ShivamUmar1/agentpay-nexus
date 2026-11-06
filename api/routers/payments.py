@@ -77,7 +77,9 @@ async def create_paypal_order(
         task_title=task.title,
         amount=amount,
         currency="USD",
-        items=invoice.items
+        items=invoice.items,
+        return_url=payload.return_url,
+        cancel_url=payload.cancel_url
     )
 
     # Persist or update transaction record
