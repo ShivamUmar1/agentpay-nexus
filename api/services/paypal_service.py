@@ -180,6 +180,18 @@ class PayPalService:
                 "approval_url": approval_link
             }
 
+    async def get_order(self, order_id: str) -> Dict[str, Any]:
+        """Fetches live order details from PayPal Orders v2 API."""
+        if order_id.startswith("SIM-ORD-") or not self.is_configured:
+            return {"id": order_id, "status": "APPROVED"}
+        token = await self.get_access_token()
+        url = f"{settings.paypal_endpoint}/v2/checkout/orders/{order_id}"
+        headers = {"Authorization": f"Bearer {token}"}
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            res = await client.get(url, headers=headers)
+            res.raise_for_status()
+            return res.json()
+
     async def capture_order(
         self,
         order_id: str,
