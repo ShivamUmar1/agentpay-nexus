@@ -29,9 +29,9 @@ class PayPalService:
         if self._access_token and now < self._token_expires_at - 60:
             return self._access_token
 
-        auth_header = base64.b64encode(
-            f"{settings.PAYPAL_CLIENT_ID}:{settings.PAYPAL_CLIENT_SECRET}".encode()
-        ).decode()
+        client_id = settings.PAYPAL_CLIENT_ID
+        client_secret = settings.PAYPAL_CLIENT_SECRET
+        auth_header = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
 
         url = f"{settings.paypal_endpoint}/v1/oauth2/token"
         headers = {
@@ -53,6 +53,38 @@ class PayPalService:
             logger.error(f"PayPal OAuth token acquisition failed: {e}")
             raise RuntimeError(f"Failed to authenticate with PayPal API: {str(e)}")
 
+    async def test_connection(self) -> Dict[str, Any]:
+        """Tests connectivity and OAuth credentials against the PayPal Sandbox environment."""
+        if not self.is_configured:
+            return {
+                "status": "simulated_demo_mode",
+                "configured": False,
+                "mode": settings.PAYPAL_MODE,
+                "message": "PayPal credentials not set; running in simulated demo mode."
+            }
+
+        t0 = time.time()
+        try:
+            token = await self.get_access_token()
+            latency = round((time.time() - t0) * 1000, 1)
+            # Mask client id prefix
+            cid_masked = f"{settings.PAYPAL_CLIENT_ID[:6]}...{settings.PAYPAL_CLIENT_ID[-4:]}" if len(settings.PAYPAL_CLIENT_ID or "") > 10 else "configured"
+            return {
+                "status": "sandbox_connected",
+                "configured": True,
+                "mode": settings.PAYPAL_MODE,
+                "latency_ms": latency,
+                "client_id": cid_masked,
+                "token_active": bool(token)
+            }
+        except Exception as e:
+            return {
+                "status": "auth_failed",
+                "configured": True,
+                "mode": settings.PAYPAL_MODE,
+                "error": str(e)
+            }
+
     async def create_order(
         self,
         task_id: str,
@@ -71,6 +103,7 @@ class PayPalService:
                 "amount": amount,
                 "currency": currency,
                 "provider": "simulated",
+                "is_simulated": True,
                 "approval_url": f"{settings.APP_BASE_URL}/checkout?order_id={simulated_order_id}"
             }
 
@@ -87,13 +120,13 @@ class PayPalService:
         if items:
             for it in items:
                 paypal_items.append({
-                    "name": it.agent_name[:127],
-                    "description": f"Autonomous service: {it.category}"[:127],
+                    "name": getattr(it, "agent_name", "AI Agent")[:127],
+                    "description": f"Autonomous service: {getattr(it, 'category', 'AI Services')}"[:127],
                     "unit_amount": {
                         "currency_code": currency,
-                        "value": f"{it.unit_price:.2f}"
+                        "value": f"{getattr(it, 'unit_price', amount):.2f}"
                     },
-                    "quantity": str(it.quantity)
+                    "quantity": str(getattr(it, "quantity", 1))
                 })
 
         payload: Dict[str, Any] = {
@@ -111,7 +144,7 @@ class PayPalService:
                                 "currency_code": currency,
                                 "value": f"{amount:.2f}"
                             }
-                        }
+                        } if paypal_items else {}
                     }
                 }
             ],
@@ -143,6 +176,7 @@ class PayPalService:
                 "amount": amount,
                 "currency": currency,
                 "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                "is_simulated": False,
                 "approval_url": approval_link
             }
 
@@ -164,6 +198,7 @@ class PayPalService:
                 "amount": expected_amount,
                 "currency": currency,
                 "provider": "simulated",
+                "is_simulated": True,
                 "message": "Simulated payment captured successfully (Demo Mode)."
             }
 
@@ -192,6 +227,7 @@ class PayPalService:
                     "amount": expected_amount,
                     "currency": currency,
                     "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                    "is_simulated": False,
                     "message": f"Payment capture status is {status}, expected COMPLETED"
                 }
 
@@ -213,6 +249,7 @@ class PayPalService:
                 "amount": captured_amount,
                 "currency": currency,
                 "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                "is_simulated": False,
                 "message": "PayPal payment captured and verified successfully."
             }
 

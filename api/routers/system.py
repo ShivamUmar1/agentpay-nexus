@@ -1,8 +1,8 @@
-from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
-from sqlalchemy import text
-from api.database import get_db
+import asyncio
+from datetime import datetime
+from fastapi import APIRouter
 from api.config import settings
+from api.database import test_db_connection
 from api.services.paypal_service import paypal_service
 from api.services.llm_provider import llm_provider
 
@@ -15,38 +15,25 @@ def health_check():
     return {
         "status": "healthy",
         "service": settings.APP_NAME,
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "timestamp": datetime.utcnow().isoformat()
     }
 
 
 @router.get("/system/status")
-def system_status(db: Session = Depends(get_db)):
-    """Diagnostic endpoint reporting backend integrations without exposing secret keys."""
-    # Test DB
-    db_ok = True
-    try:
-        db.execute(text("SELECT 1"))
-    except Exception:
-        db_ok = False
+async def system_status():
+    """Live diagnostic endpoint reporting true backend integrations without exposing secret keys."""
+    # Run diagnostics concurrently
+    db_status = test_db_connection()
+    ai_status = await llm_provider.test_connection()
+    payment_status = await paypal_service.test_connection()
 
     return {
         "service": settings.APP_NAME,
         "environment": settings.APP_ENV,
-        "database": {
-            "status": "connected" if db_ok else "error",
-            "type": "postgresql" if "postgres" in settings.DATABASE_URL else "sqlite"
-        },
-        "ai_orchestration": {
-            "provider": llm_provider.provider_name,
-            "status": "active",
-            "model": settings.GEMINI_MODEL if llm_provider.provider_name == "gemini" else (settings.OPENAI_MODEL if llm_provider.provider_name == "openai" else "deterministic_engine_v1")
-        },
-        "payment_gateway": {
-            "provider": "PayPal REST API v2",
-            "mode": settings.PAYPAL_MODE,
-            "configured": paypal_service.is_configured,
-            "status": "sandbox_ready" if paypal_service.is_configured else "simulated_demo_mode",
-            "client_id_set": bool(settings.PAYPAL_CLIENT_ID)
-        },
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "timestamp": datetime.utcnow().isoformat(),
+        "database": db_status,
+        "ai_orchestration": ai_status,
+        "payment_gateway": payment_status
     }

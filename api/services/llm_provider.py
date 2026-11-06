@@ -1,6 +1,7 @@
 import json
 import logging
 import re
+import time
 from typing import Dict, Any, Optional
 import httpx
 from api.config import settings
@@ -9,7 +10,7 @@ logger = logging.getLogger(__name__)
 
 
 def extract_json(text: str) -> Dict[str, Any]:
-    """Extracts JSON object from LLM response text, handling markdown fences."""
+    """Extracts JSON object from LLM response text, handling markdown fences and formatting."""
     text = text.strip()
     match = re.search(r"```(?:json)?\s*([\s\S]*?)\s*```", text)
     if match:
@@ -17,7 +18,6 @@ def extract_json(text: str) -> Dict[str, Any]:
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        # Fallback regex search for { ... }
         brace_match = re.search(r"(\{[\s\S]*\})", text)
         if brace_match:
             try:
@@ -30,11 +30,21 @@ def extract_json(text: str) -> Dict[str, Any]:
 class LLMProvider:
     """Central provider abstraction supporting Gemini, OpenAI, and deterministic demo fallback."""
 
-    def __init__(self):
-        self.gemini_key = settings.GEMINI_API_KEY
-        self.openai_key = settings.OPENAI_API_KEY
-        self.gemini_model = settings.GEMINI_MODEL
-        self.openai_model = settings.OPENAI_MODEL
+    @property
+    def gemini_key(self) -> Optional[str]:
+        return settings.GEMINI_API_KEY
+
+    @property
+    def openai_key(self) -> Optional[str]:
+        return settings.OPENAI_API_KEY
+
+    @property
+    def gemini_model(self) -> str:
+        return settings.GEMINI_MODEL
+
+    @property
+    def openai_model(self) -> str:
+        return settings.OPENAI_MODEL
 
     @property
     def provider_name(self) -> str:
@@ -47,9 +57,17 @@ class LLMProvider:
     async def generate_text(self, prompt: str, system_instruction: Optional[str] = None) -> str:
         """Generates text from the configured provider or fallback."""
         if self.gemini_key:
-            return await self._call_gemini(prompt, system_instruction)
+            try:
+                return await self._call_gemini(prompt, system_instruction, as_json=False)
+            except Exception as e:
+                logger.warning(f"Gemini text call failed: {e}. Falling back to demo generator.")
+                return self._generate_fallback_text(prompt, system_instruction)
         elif self.openai_key:
-            return await self._call_openai(prompt, system_instruction)
+            try:
+                return await self._call_openai(prompt, system_instruction)
+            except Exception as e:
+                logger.warning(f"OpenAI text call failed: {e}. Falling back to demo generator.")
+                return self._generate_fallback_text(prompt, system_instruction)
         return self._generate_fallback_text(prompt, system_instruction)
 
     async def generate_json(self, prompt: str, system_instruction: Optional[str] = None) -> Dict[str, Any]:
@@ -57,23 +75,40 @@ class LLMProvider:
         full_system = (system_instruction or "") + "\n\nCRITICAL: Respond ONLY with a valid JSON object. Do not include introductory or concluding conversational prose."
         
         if self.gemini_key:
-            text = await self._call_gemini(prompt, full_system)
-            return extract_json(text)
+            try:
+                text = await self._call_gemini(prompt, full_system, as_json=True)
+                return extract_json(text)
+            except Exception as e:
+                logger.warning(f"Gemini JSON generation failed: {e}. Falling back to demo generator.")
+                return self._generate_fallback_json(prompt, system_instruction)
         elif self.openai_key:
-            text = await self._call_openai(prompt, full_system)
-            return extract_json(text)
+            try:
+                text = await self._call_openai(prompt, full_system)
+                return extract_json(text)
+            except Exception as e:
+                logger.warning(f"OpenAI JSON generation failed: {e}. Falling back to demo generator.")
+                return self._generate_fallback_json(prompt, system_instruction)
         
         return self._generate_fallback_json(prompt, system_instruction)
 
-    async def _call_gemini(self, prompt: str, system_instruction: Optional[str] = None) -> str:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent?key={self.gemini_key}"
-        contents = []
-        if system_instruction:
-            contents.append({"role": "user", "parts": [{"text": f"System context: {system_instruction}"}]})
-            contents.append({"role": "model", "parts": [{"text": "Understood. I will strictly follow this context."}]})
-        contents.append({"role": "user", "parts": [{"text": prompt}]})
+    async def _call_gemini(
+        self,
+        prompt: str,
+        system_instruction: Optional[str] = None,
+        as_json: bool = False
+    ) -> str:
+        key = self.gemini_key
+        if not key:
+            raise ValueError("GEMINI_API_KEY is not configured.")
 
-        payload = {
+        model = self.gemini_model
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+        
+        contents = [
+            {"role": "user", "parts": [{"text": prompt}]}
+        ]
+
+        payload: Dict[str, Any] = {
             "contents": contents,
             "generationConfig": {
                 "temperature": 0.2,
@@ -81,11 +116,32 @@ class LLMProvider:
             }
         }
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(url, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            return data["candidates"][0]["content"]["parts"][0]["text"]
+        if system_instruction:
+            payload["system_instruction"] = {
+                "parts": [{"text": system_instruction}]
+            }
+
+        if as_json:
+            payload["generationConfig"]["responseMimeType"] = "application/json"
+
+        async with httpx.AsyncClient(timeout=35.0) as client:
+            try:
+                response = await client.post(url, json=payload)
+                if response.status_code == 404 and model != "gemini-1.5-flash":
+                    fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={key}"
+                    logger.warning(f"Model {model} returned 404; retrying with gemini-1.5-flash")
+                    response = await client.post(fallback_url, json=payload)
+
+                response.raise_for_status()
+                data = response.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"]
+            except httpx.HTTPStatusError as e:
+                err_text = e.response.text
+                logger.error(f"Gemini API HTTP Error {e.response.status_code}: {err_text}")
+                raise RuntimeError(f"Gemini API HTTP {e.response.status_code}: {err_text}")
+            except Exception as e:
+                logger.error(f"Gemini network or execution error: {e}")
+                raise
 
     async def _call_openai(self, prompt: str, system_instruction: Optional[str] = None) -> str:
         url = "https://api.openai.com/v1/chat/completions"
@@ -110,6 +166,40 @@ class LLMProvider:
             response.raise_for_status()
             data = response.json()
             return data["choices"][0]["message"]["content"]
+
+    async def test_connection(self) -> Dict[str, Any]:
+        """Tests live inference with the configured provider and reports latency and status."""
+        if not self.gemini_key and not self.openai_key:
+            return {
+                "status": "demo_fallback",
+                "provider": "deterministic_fallback",
+                "model": "deterministic_engine_v1",
+                "message": "No external AI credentials configured; using deterministic fallback engine."
+            }
+        
+        provider = self.provider_name
+        model = self.gemini_model if provider == "gemini" else self.openai_model
+        t0 = time.time()
+        try:
+            res = await self.generate_text(
+                "Respond with the word 'OK' only.",
+                system_instruction="You are a health check probe. Output 'OK' only."
+            )
+            latency = round((time.time() - t0) * 1000, 1)
+            return {
+                "status": "connected",
+                "provider": provider,
+                "model": model,
+                "latency_ms": latency,
+                "sample_response": res.strip()[:60]
+            }
+        except Exception as e:
+            return {
+                "status": "error",
+                "provider": provider,
+                "model": model,
+                "error": str(e)
+            }
 
     def _generate_fallback_text(self, prompt: str, system_instruction: Optional[str] = None) -> str:
         """Deterministic high-quality fallback text when API keys are not supplied."""

@@ -129,21 +129,36 @@ export interface ActivityLog {
 export interface SystemStatus {
   service: string;
   environment: string;
+  version: string;
+  timestamp: string;
   database: {
     status: string;
     type: string;
+    hosted?: string;
+    persistent?: boolean;
+    latency_ms?: number;
+    counts?: {
+      agents: number;
+      tasks: number;
+      transactions: number;
+    };
+    error?: string;
   };
   ai_orchestration: {
     provider: string;
     status: string;
     model: string;
+    latency_ms?: number;
+    sample_response?: string;
+    error?: string;
   };
   payment_gateway: {
-    provider: string;
-    mode: string;
-    configured: boolean;
     status: string;
-    client_id_set: boolean;
+    mode: string;
+    configured?: boolean;
+    client_id?: string;
+    latency_ms?: number;
+    token_active?: boolean;
+    error?: string;
   };
-  version: string;
 }
