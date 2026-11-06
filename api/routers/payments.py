@@ -72,6 +72,32 @@ async def create_paypal_order(
     task.total_cost = amount
     db.commit()
 
+    # Reuse existing active order if in CREATED or APPROVED status to prevent redundant order creation
+    existing_tx = db.query(TransactionModel).filter(
+        TransactionModel.task_id == task.id,
+        TransactionModel.payment_status == "pending"
+    ).first()
+
+    if existing_tx and existing_tx.paypal_order_id and not existing_tx.paypal_order_id.startswith("SIM-"):
+        try:
+            existing_order = await paypal_service.get_order(existing_tx.paypal_order_id)
+            status = existing_order.get("status")
+            if status in ["CREATED", "APPROVED"]:
+                approval_link = next(
+                    (l["href"] for l in existing_order.get("links", []) if l.get("rel") == "approve"),
+                    f"https://www.sandbox.paypal.com/checkoutnow?token={existing_tx.paypal_order_id}"
+                )
+                return OrderCreateResponse(
+                    order_id=existing_tx.paypal_order_id,
+                    status=status,
+                    amount=amount,
+                    currency="USD",
+                    provider=existing_tx.provider,
+                    approval_url=approval_link
+                )
+        except Exception as e:
+            logger.warning(f"Could not verify existing order {existing_tx.paypal_order_id}: {e}")
+
     order_result = await paypal_service.create_order(
         task_id=task.id,
         task_title=task.title,
@@ -121,6 +147,22 @@ async def create_paypal_order(
     )
 
 
+@router.get("/paypal/order/{order_id}")
+async def get_paypal_order_status(order_id: str, db: Session = Depends(get_db)):
+    """Retrieves live verification status of a PayPal order directly from PayPal Orders v2 API."""
+    try:
+        order = await paypal_service.get_order(order_id)
+        return {
+            "order_id": order_id,
+            "status": order.get("status"),
+            "intent": order.get("intent"),
+            "amount": order.get("purchase_units", [{}])[0].get("amount"),
+            "payee": order.get("purchase_units", [{}])[0].get("payee")
+        }
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to retrieve order: {str(e)}")
+
+
 @router.post("/paypal/capture-order", response_model=OrderCaptureResponse)
 async def capture_paypal_order(
     payload: OrderCaptureRequest,
@@ -137,8 +179,8 @@ async def capture_paypal_order(
         TransactionModel.paypal_order_id == payload.order_id
     ).first()
 
+    # 1. Prevent duplicate captures (Idempotency Guard)
     if tx and tx.payment_status in ["completed", "simulated_completed"]:
-        # Idempotent response
         return OrderCaptureResponse(
             success=True,
             transaction_id=tx.id,
@@ -153,6 +195,44 @@ async def capture_paypal_order(
 
     expected_amount = task.total_cost or 8.00
 
+    # 2. Retrieve live order directly from PayPal to verify APPROVED state before capturing
+    if not payload.order_id.startswith("SIM-") and paypal_service.is_configured:
+        try:
+            live_order = await paypal_service.get_order(payload.order_id)
+            live_status = live_order.get("status")
+
+            if live_status == "COMPLETED":
+                # Already captured on PayPal
+                if tx:
+                    tx.payment_status = "completed"
+                    db.commit()
+                task.status = "paid"
+                db.commit()
+                return OrderCaptureResponse(
+                    success=True,
+                    transaction_id=tx.id if tx else "tx_already_completed",
+                    capture_id=tx.paypal_capture_id if tx else "cap_completed",
+                    order_id=payload.order_id,
+                    status="COMPLETED",
+                    amount=expected_amount,
+                    currency="USD",
+                    provider="paypal_sandbox",
+                    message="Order is already captured and completed."
+                )
+
+            if live_status != "APPROVED":
+                logger.warning(f"Capture attempt rejected: Order {payload.order_id} is in status '{live_status}', not 'APPROVED'.")
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Capture failed: Order status on PayPal is '{live_status}'. The buyer must log in to PayPal and approve the payment first."
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"Error checking order status on PayPal: {e}")
+            raise HTTPException(status_code=400, detail=f"Failed to verify order approval on PayPal: {str(e)}")
+
+    # 3. Execute Capture strictly on approved orders
     capture_res = await paypal_service.capture_order(
         order_id=payload.order_id,
         expected_amount=expected_amount,
@@ -191,6 +271,13 @@ async def capture_paypal_order(
         await orchestration_engine.advance_task(db, task.id)
     except Exception as e:
         logger.error(f"Error auto-advancing deliverable post-payment: {e}")
+
+    log_activity(
+        db, task.id, "payment",
+        f"PayPal payment captured successfully: {capture_res.get('capture_id')} for ${capture_res['amount']:.2f} USD.",
+        agent_id="agent_payment_06"
+    )
+    db.commit()
 
     return OrderCaptureResponse(
         success=True,

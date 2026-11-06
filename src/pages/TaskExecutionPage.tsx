@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useParams, Link } from 'react-router-dom';
+import { useParams, Link, useSearchParams } from 'react-router-dom';
 import ReactMarkdown from 'react-markdown';
 import { 
   BarChart, 
@@ -21,6 +21,7 @@ import {
   RotateCw, 
   CheckCircle2, 
   AlertCircle, 
+  AlertTriangle,
   CreditCard, 
   Download, 
   Copy, 
@@ -44,6 +45,11 @@ const CHART_COLORS = ['#00F0FF', '#0080FF', '#8B5CF6', '#10B981', '#F59E0B'];
 
 export const TaskExecutionPage: React.FC = () => {
   const { taskId } = useParams<{ taskId: string }>();
+  const [searchParams, setSearchParams] = useSearchParams();
+  const isCancelled = searchParams.get('cancelled') === 'true';
+  const isApproved = searchParams.get('approved') === 'true';
+  const token = searchParams.get('token');
+
   const [task, setTask] = useState<Task | null>(null);
   const [logs, setLogs] = useState<ActivityLog[]>([]);
   const [selectedStep, setSelectedStep] = useState<TaskStep | null>(null);
@@ -52,10 +58,15 @@ export const TaskExecutionPage: React.FC = () => {
   const [autoRun, setAutoRun] = useState(false);
   const [activeTab, setActiveTab] = useState<'report' | 'charts' | 'audit' | 'raw'>('report');
   
-  // Payment modal state
+  // Payment state & notices
   const [paymentSummary, setPaymentSummary] = useState<PaymentSummary | null>(null);
   const [showPaymentModal, setShowPaymentModal] = useState(false);
+  const [paymentNotice, setPaymentNotice] = useState<{
+    type: 'cancelled' | 'success' | 'error' | 'capturing';
+    message: string;
+  } | null>(null);
   const [copied, setCopied] = useState(false);
+  const capturingRef = useRef(false);
 
   // Polling ref
   const autoRunRef = useRef(autoRun);
@@ -93,6 +104,55 @@ export const TaskExecutionPage: React.FC = () => {
     return () => clearInterval(interval);
   }, [taskId]);
 
+  // Handle PayPal Cancellation
+  useEffect(() => {
+    if (isCancelled) {
+      setPaymentNotice({
+        type: 'cancelled',
+        message: 'PayPal checkout session was cancelled. Your invoice of $8.00 USD is preserved and awaiting authorization whenever you are ready.'
+      });
+      setShowPaymentModal(false);
+    }
+  }, [isCancelled]);
+
+  // Handle PayPal Approval -> Automatic Server-Side Capture
+  useEffect(() => {
+    if (isApproved && token && task && task.status === 'awaiting_payment' && !capturingRef.current) {
+      capturingRef.current = true;
+      setPaymentNotice({
+        type: 'capturing',
+        message: 'PayPal Buyer Approval Detected! Validating order on PayPal and capturing payment server-side...'
+      });
+
+      const executeCapture = async () => {
+        try {
+          const res = await api.capturePayPalOrder(task.id, token);
+          if (res.success) {
+            setPaymentNotice({
+              type: 'success',
+              message: `Payment Verified & Captured ($${res.amount.toFixed(2)} ${res.currency})! Order ID: ${res.order_id}. Final deliverable unlocked!`
+            });
+            setShowPaymentModal(false);
+            setSearchParams({});
+            await loadTaskData();
+          } else {
+            setPaymentNotice({
+              type: 'error',
+              message: res.message || 'Payment capture failed.'
+            });
+          }
+        } catch (err: any) {
+          setPaymentNotice({
+            type: 'error',
+            message: err.message || 'Could not capture payment. Please ensure buyer approval was completed on PayPal.'
+          });
+        }
+      };
+
+      executeCapture();
+    }
+  }, [isApproved, token, task?.status]);
+
   // Auto-runner loop
   useEffect(() => {
     if (!autoRun || !task || advancing) return;
@@ -103,10 +163,12 @@ export const TaskExecutionPage: React.FC = () => {
       }, 1500);
       return () => clearTimeout(timer);
     } else if (task.status === 'awaiting_payment') {
-      handleOpenPaymentModal();
+      if (!isCancelled && !isApproved) {
+        handleOpenPaymentModal();
+      }
       setAutoRun(false);
     }
-  }, [autoRun, task?.status, task?.current_step, advancing]);
+  }, [autoRun, task?.status, task?.current_step, advancing, isCancelled, isApproved]);
 
   const handleAdvanceStep = async () => {
     if (!taskId || advancing) return;
@@ -181,6 +243,44 @@ export const TaskExecutionPage: React.FC = () => {
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+      {/* Payment Notification Banner */}
+      {paymentNotice && (
+        <div className={`p-4 rounded-xl border flex items-center justify-between gap-3 text-xs animate-fadeIn ${
+          paymentNotice.type === 'cancelled'
+            ? 'bg-amber-500/10 border-amber-500/30 text-amber-300'
+            : paymentNotice.type === 'capturing'
+            ? 'bg-cyan-500/10 border-cyan-500/30 text-cyan-300'
+            : paymentNotice.type === 'success'
+            ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+            : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+        }`}>
+          <div className="flex items-start gap-2.5">
+            {paymentNotice.type === 'cancelled' && <AlertTriangle className="w-4 h-4 text-amber-400 mt-0.5 shrink-0" />}
+            {paymentNotice.type === 'capturing' && <Loader2 className="w-4 h-4 text-cyan-400 animate-spin mt-0.5 shrink-0" />}
+            {paymentNotice.type === 'success' && <CheckCircle2 className="w-4 h-4 text-emerald-400 mt-0.5 shrink-0" />}
+            {paymentNotice.type === 'error' && <AlertCircle className="w-4 h-4 text-rose-400 mt-0.5 shrink-0" />}
+            <div>
+              <span className="font-bold uppercase tracking-wider text-[10px] block">
+                {paymentNotice.type === 'cancelled' && 'PayPal Checkout Session Cancelled'}
+                {paymentNotice.type === 'capturing' && 'Server-Side Verification & Capture'}
+                {paymentNotice.type === 'success' && 'Payment Verified & Completed'}
+                {paymentNotice.type === 'error' && 'Payment Capture Alert'}
+              </span>
+              <span className="mt-0.5 block text-slate-300">{paymentNotice.message}</span>
+            </div>
+          </div>
+
+          {paymentNotice.type === 'cancelled' && isAwaitingPayment && (
+            <button
+              onClick={handleOpenPaymentModal}
+              className="px-3 py-1.5 rounded-lg bg-amber-500 hover:bg-amber-400 text-navy-950 font-bold text-xs shrink-0 transition-colors shadow-sm"
+            >
+              Review Invoice & Pay ($8.00)
+            </button>
+          )}
+        </div>
+      )}
+
       {/* Header Bar */}
       <div className="glass-panel rounded-2xl p-5 border border-slate-800 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div>

@@ -25,22 +25,32 @@ export const InvoiceModal: React.FC<InvoiceModalProps> = ({
   onPaymentSuccess
 }) => {
   const [loading, setLoading] = useState(false);
+  const [redirecting, setRedirecting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [simulatedMode, setSimulatedMode] = useState(true);
 
   if (!summary) return null;
 
-  const handlePaypalCapture = async () => {
+  const handleAuthorizePayPal = async () => {
     try {
       setLoading(true);
       setError(null);
 
-      // Step 1: Create Order via backend
-      const order = await api.createPayPalOrder(summary.task_id);
-      
-      // Step 2: Capture Order via backend
+      // Explicit return and cancel URLs
+      const returnUrl = `${window.location.origin}/tasks/${summary.task_id}?approved=true`;
+      const cancelUrl = `${window.location.origin}/tasks/${summary.task_id}?cancelled=true`;
+
+      // Step 1: Create or retrieve active PayPal order via backend
+      const order = await api.createPayPalOrder(summary.task_id, returnUrl, cancelUrl);
+
+      // Step 2: If official approval URL is present, redirect buyer to PayPal Sandbox
+      if (order.approval_url) {
+        setRedirecting(true);
+        window.location.href = order.approval_url;
+        return;
+      }
+
+      // Step 3: Fallback for simulated demo mode only
       const capture = await api.capturePayPalOrder(summary.task_id, order.order_id);
-      
       if (capture.success) {
         onPaymentSuccess(capture);
         onClose();
@@ -151,14 +161,19 @@ export const InvoiceModal: React.FC<InvoiceModalProps> = ({
         {/* PayPal Checkout Actions */}
         <div className="mt-6 space-y-3">
           <button
-            onClick={handlePaypalCapture}
-            disabled={loading}
+            onClick={handleAuthorizePayPal}
+            disabled={loading || redirecting}
             className="w-full py-3.5 px-4 rounded-xl bg-gradient-to-r from-[#0070BA] to-[#003087] hover:from-[#005ea6] hover:to-[#00256c] text-white font-bold text-sm flex items-center justify-center gap-2 shadow-lg shadow-blue-500/20 transition-all duration-200 disabled:opacity-50"
           >
-            {loading ? (
+            {redirecting ? (
               <>
                 <Loader2 className="w-4 h-4 animate-spin text-white" />
-                <span>Authorizing PayPal Capture...</span>
+                <span>Redirecting to PayPal Checkout...</span>
+              </>
+            ) : loading ? (
+              <>
+                <Loader2 className="w-4 h-4 animate-spin text-white" />
+                <span>Contacting PayPal Orders v2...</span>
               </>
             ) : (
               <>

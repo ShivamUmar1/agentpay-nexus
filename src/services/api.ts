@@ -94,12 +94,21 @@ export const api = {
     return handleResponse(res);
   },
 
-  async createPayPalOrder(taskId: string): Promise<{ order_id: string; status: string; amount: number; currency: string; provider: string; approval_url?: string }> {
+  async createPayPalOrder(taskId: string, returnUrl?: string, cancelUrl?: string): Promise<{ order_id: string; status: string; amount: number; currency: string; provider: string; approval_url?: string }> {
     const res = await fetch(`${API_BASE}/api/payments/paypal/create-order`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ task_id: taskId }),
+      body: JSON.stringify({ 
+        task_id: taskId,
+        return_url: returnUrl,
+        cancel_url: cancelUrl
+      }),
     });
+    return handleResponse(res);
+  },
+
+  async getPayPalOrderStatus(orderId: string): Promise<{ order_id: string; status: string; intent?: string; amount?: any; payee?: any }> {
+    const res = await fetch(`${API_BASE}/api/payments/paypal/order/${orderId}`);
     return handleResponse(res);
   },
 

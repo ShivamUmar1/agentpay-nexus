@@ -26,7 +26,7 @@ def capture(task_id, order_id):
         return False
 
 if __name__ == "__main__":
-    task_id = sys.argv[1] if len(sys.argv) > 1 else "ccf38662-8f68-47be-ba65-7ada6a582dde"
-    order_id = sys.argv[2] if len(sys.argv) > 2 else "5T221767YN836201T"
+    task_id = sys.argv[1] if len(sys.argv) > 1 else "3fda270f-0680-4a03-a495-01782ac9b505"
+    order_id = sys.argv[2] if len(sys.argv) > 2 else "5AF69624KS630330A"
     capture(task_id, order_id)
 
