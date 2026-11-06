@@ -212,8 +212,28 @@ class PayPalService:
         async with httpx.AsyncClient(timeout=20.0) as client:
             res = await client.post(url, headers=headers)
             if res.status_code >= 400:
-                logger.error(f"PayPal capture failed: {res.text}")
-                raise RuntimeError(f"PayPal capture failed: {res.text}")
+                err_data = {}
+                try:
+                    err_data = res.json()
+                except Exception:
+                    pass
+                details = (
+                    (err_data.get("details", [{}])[0].get("description")) or
+                    err_data.get("message") or
+                    res.text
+                )
+                logger.error(f"PayPal capture failed ({res.status_code}): {details}")
+                return {
+                    "success": False,
+                    "order_id": order_id,
+                    "capture_id": None,
+                    "status": "FAILED",
+                    "amount": expected_amount,
+                    "currency": currency,
+                    "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                    "is_simulated": False,
+                    "message": f"PayPal capture rejected: {details}"
+                }
 
             capture_data = res.json()
             status = capture_data.get("status")
