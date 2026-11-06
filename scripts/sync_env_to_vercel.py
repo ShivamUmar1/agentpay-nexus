@@ -2,6 +2,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from dotenv import dotenv_values
 
 ENV_PATH = Path("D:/paypal hackathon/.env")
 
@@ -11,60 +12,48 @@ REQUIRED_VARS = [
     "PAYPAL_CLIENT_ID",
     "PAYPAL_CLIENT_SECRET",
     "PAYPAL_MODE",
-    "GEMINI_MODEL"
+    "GEMINI_MODEL",
+    "VITE_PAYPAL_CLIENT_ID"
 ]
 
-def load_local_env():
-    if not ENV_PATH.exists():
-        return {}
-    env_vars = {}
-    with open(ENV_PATH, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line or line.startswith("#"):
-                continue
-            if "=" in line:
-                k, v = line.split("=", 1)
-                k = k.strip()
-                v = v.strip().strip("'\"")
-                if v:
-                    env_vars[k] = v
-    return env_vars
-
-def sync_to_vercel(env_vars):
-    print("=== SYNCHRONIZING SECURE ENVIRONMENT VARIABLES TO VERCEL ===\n")
-    for key, val in env_vars.items():
-        if key not in REQUIRED_VARS:
+def sync_to_vercel():
+    vals = dotenv_values(ENV_PATH)
+    if not vals:
+        print(f"No environment variables found in {ENV_PATH}.")
+        sys.exit(1)
+        
+    print("=== SYNCHRONIZING SECURE ENVIRONMENT VARIABLES TO VERCEL ===")
+    for key in REQUIRED_VARS:
+        val = vals.get(key)
+        if not val:
+            print(f"[SKIP] {key}: not found in .env")
             continue
-        print(f"Setting {key} in Vercel Production...")
-        # Use vercel env add with stdin to avoid printing secrets in terminal args
-        for env_target in ["production", "preview", "development"]:
-            # First remove existing to prevent duplicate errors
-            cmd_rm = f"npx.cmd vercel env rm {key} {env_target} -y"
-            subprocess.run(cmd_rm, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             
-            # Now add
-            proc = subprocess.Popen(
-                f"npx.cmd vercel env add {key} {env_target}",
-                shell=True,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True
-            )
-            stdout, stderr = proc.communicate(input=f"{val}\n")
-            if proc.returncode == 0:
-                print(f"  ✓ {key} added to {env_target}")
-            else:
-                print(f"  Note on {key} ({env_target}): {stdout.strip() or stderr.strip()}")
+        print(f"Syncing {key} to Vercel...")
+        for env_target in ["production", "preview"]:
+            cmd = [
+                "cmd.exe", "/c", "npx", "vercel", "env", "add",
+                key, env_target,
+                "--force", "--yes", "--non-interactive",
+                "--value", val
+            ]
+            try:
+                res = subprocess.run(
+                    cmd,
+                    stdin=subprocess.DEVNULL,
+                    capture_output=True,
+                    text=True,
+                    timeout=20
+                )
+                if res.returncode == 0:
+                    print(f"  + [OK] {key} -> {env_target}")
+                else:
+                    err = res.stderr.strip() or res.stdout.strip()
+                    print(f"  - [NOTICE] {key} -> {env_target}: {err}")
+            except Exception as e:
+                print(f"  - [ERROR] {key} -> {env_target}: {e}")
 
     print("\nEnvironment synchronization complete!")
 
 if __name__ == "__main__":
-    env_vars = load_local_env()
-    if not env_vars:
-        print(f"No environment variables found in {ENV_PATH}.")
-        print("Please configure your keys in .env, then re-run this script.")
-        sys.exit(1)
-    sync_to_vercel(env_vars)
-
+    sync_to_vercel()

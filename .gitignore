@@ -9,6 +9,7 @@ __pycache__/
 
 # Environment and sensitive keys
 .env
+.env*
 .env.local
 .env.*.local
 *.pem
