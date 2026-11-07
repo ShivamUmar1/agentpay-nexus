@@ -8,6 +8,7 @@ from api.models.task import TaskModel, TaskStepModel, AgentRunModel
 from api.models.agent import AgentModel
 from api.models.log import ActivityLogModel
 from api.models.payment import TransactionModel
+from api.services.llm_provider import AIError
 from api.services.agents.orchestrator_agent import OrchestratorAgent
 from api.services.agents.research_agent import ResearchAgent
 from api.services.agents.data_analysis_agent import DataAnalysisAgent
@@ -78,14 +79,26 @@ class OrchestrationEngine:
         )
 
         # Generate structured plan via Orchestrator Agent
-        plan = await orchestrator_agent.create_plan(
-            title=title,
-            description=description,
-            budget=budget,
-            currency=currency,
-            constraints=constraints or "",
-            db=db
-        )
+        try:
+            plan = await orchestrator_agent.create_plan(
+                title=title,
+                description=description,
+                budget=budget,
+                currency=currency,
+                constraints=constraints or "",
+                db=db
+            )
+        except AIError as ai_err:
+            task.status = "failed"
+            task.current_step = "planning"
+            log_activity(
+                db, task.id, "error",
+                f"Multi-agent planning halted: {ai_err.user_message}",
+                agent_id=orchestrator_agent.AGENT_ID,
+                metadata=ai_err.to_dict()
+            )
+            db.commit()
+            raise
 
         task.execution_plan = json.dumps(plan)
         task.status = "executing"
@@ -261,6 +274,20 @@ class OrchestrationEngine:
                 "advanced_step": next_step.step_name,
                 "total_cost": task.total_cost
             }
+
+        except AIError as ai_err:
+            logger.warning(f"Step {next_step.step_name} halted by AI provider error ({ai_err.kind.value}): {ai_err.message}")
+            next_step.status = "failed"
+            next_step.error_message = ai_err.user_message
+            task.status = "failed"
+            log_activity(
+                db, task.id, "error",
+                f"Step '{next_step.step_name}' failed: {ai_err.user_message}",
+                agent_id=next_step.assigned_agent_id,
+                metadata=ai_err.to_dict()
+            )
+            db.commit()
+            raise
 
         except Exception as e:
             logger.error(f"Step {next_step.step_name} execution error: {e}", exc_info=True)
@@ -446,6 +473,7 @@ class OrchestrationEngine:
         deliverables = {
             "title": task.title,
             "description": task.description,
+            "execution_mode": task.execution_mode,
             "report_markdown": content_output.get("report_markdown", ""),
             "executive_summary": content_output.get("executive_summary", ""),
             "key_takeaways": content_output.get("key_takeaways", []),

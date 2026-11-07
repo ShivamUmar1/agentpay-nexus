@@ -22,8 +22,10 @@ class Settings(BaseSettings):
     # AI Providers
     GEMINI_API_KEY: Optional[str] = None
     OPENAI_API_KEY: Optional[str] = None
-    GEMINI_MODEL: str = "gemini-3.8-flash"
+    GEMINI_MODEL: str = "gemini-3.5-flash-lite"
+    GEMINI_FALLBACK_MODEL: Optional[str] = None
     OPENAI_MODEL: str = "gpt-4o-mini"
+    AI_REQUEST_TIMEOUT: float = 12.0
 
     # PayPal Integration
     PAYPAL_CLIENT_ID: Optional[str] = None

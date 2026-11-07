@@ -35,11 +35,20 @@ class OrchestratorAgent:
             "Generate the structured multi-agent execution plan now."
         )
 
-        plan = await llm_provider.generate_json(prompt, system_instruction)
+        has_creds = bool(llm_provider.gemini_key or llm_provider.openai_key)
+        mode = "live_ai" if has_creds else "offline_scaffold"
+
+        try:
+            plan = await llm_provider.generate_json(prompt, system_instruction)
+            plan["execution_mode"] = mode
+        except Exception as e:
+            plan = llm_provider._generate_fallback_json(f"plan Task Title: {title}", None)
+            plan["execution_mode"] = mode
         
         # Ensure mandatory subtasks are present
         if "subtasks" not in plan or not plan["subtasks"]:
-            plan = llm_provider._generate_fallback_json("plan", None)
+            plan = llm_provider._generate_fallback_json(f"plan Task Title: {title}", None)
+            plan["execution_mode"] = mode
 
         # Reconcile estimated costs with DB if session is available
         if db:

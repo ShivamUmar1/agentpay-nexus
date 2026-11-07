@@ -22,10 +22,9 @@ def health_check():
 
 @router.get("/system/status")
 async def system_status():
-    """Live diagnostic endpoint reporting true backend integrations without exposing secret keys."""
-    # Run diagnostics concurrently
+    """Diagnostic endpoint reporting backend integration configurations without triggering external AI calls or timing out."""
     db_status = test_db_connection()
-    ai_status = await llm_provider.test_connection()
+    ai_status = llm_provider.get_status()
     payment_status = await paypal_service.test_connection()
 
     return {
@@ -37,3 +36,10 @@ async def system_status():
         "ai_orchestration": ai_status,
         "payment_gateway": payment_status
     }
+
+
+@router.get("/system/test-ai")
+@router.post("/system/test-ai")
+async def test_ai_connection():
+    """Bounded live diagnostic endpoint for testing active AI inference (max 3.0s timeout)."""
+    return await llm_provider.test_connection()

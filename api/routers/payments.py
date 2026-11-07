@@ -47,6 +47,46 @@ def get_payment_summary(task_id: str, db: Session = Depends(get_db)):
     return invoice
 
 
+def validate_task_payment_eligibility(task: TaskModel, db: Session, action: str = "create payment order") -> None:
+    """Positively validates that a task is strictly eligible for payment operations.
+
+    Enforces:
+    1. Execution mode must be live_ai (offline scaffolds categorically rejected).
+    2. Task status must be awaiting_payment.
+    3. All 6 prerequisite workflow steps must be completed.
+    4. Quality Assurance audit status must be APPROVED.
+    """
+    if task.execution_mode != "live_ai":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot {action}: Task was executed in '{task.execution_mode}' mode. Offline scaffolds are strictly ineligible for payment."
+        )
+
+    if task.status != "awaiting_payment":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot {action}: Task is in '{task.status}' status. Required state: 'awaiting_payment'."
+        )
+
+    steps = db.query(TaskStepModel).filter(TaskStepModel.task_id == task.id).all()
+    step_dict = {s.step_name: s for s in steps}
+    required_prereqs = ["planning", "research", "data_analysis", "content_generation", "quality_assurance", "finance_calculation"]
+    for prereq in required_prereqs:
+        if not step_dict.get(prereq) or step_dict[prereq].status != "completed":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot {action}: Mandatory prerequisite step '{prereq}' is not completed."
+            )
+
+    qa_step = step_dict.get("quality_assurance")
+    qa_output = json.loads(qa_step.output_data or "{}") if qa_step else {}
+    if qa_output.get("audit_status") != "APPROVED":
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot {action}: Quality Assurance audit status is '{qa_output.get('audit_status')}'. Deliverable must be APPROVED by QA before payment authorization."
+        )
+
+
 @router.post("/paypal/create-order", response_model=OrderCreateResponse)
 async def create_paypal_order(
     payload: OrderCreateRequest,
@@ -57,6 +97,9 @@ async def create_paypal_order(
     task = db.query(TaskModel).filter(TaskModel.id == payload.task_id).first()
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
+
+    # Positive server-side payment eligibility enforcement
+    validate_task_payment_eligibility(task, db, action="create payment order")
 
     # Calculate exact invoice from DB records - NEVER trust amounts from the frontend
     assigned_agents = ["agent_research_01", "agent_analysis_02", "agent_content_03", "agent_qa_04"]
@@ -114,10 +157,12 @@ async def create_paypal_order(
         TransactionModel.payment_status == "pending"
     ).first()
 
+    provider = order_result.get("provider", "paypal_sandbox")
+
     if existing_tx:
         existing_tx.paypal_order_id = order_result["order_id"]
         existing_tx.amount = amount
-        existing_tx.provider = order_result["provider"]
+        existing_tx.provider = provider
     else:
         new_tx = TransactionModel(
             user_id=user_id,
@@ -126,13 +171,13 @@ async def create_paypal_order(
             amount=amount,
             currency="USD",
             payment_status="pending",
-            provider=order_result["provider"]
+            provider=provider
         )
         db.add(new_tx)
 
     log_activity(
         db, task.id, "payment",
-        f"PayPal order created ({order_result['provider']}): {order_result['order_id']} for ${amount:.2f} USD.",
+        f"PayPal order created ({provider}): {order_result['order_id']} for ${amount:.2f} USD.",
         agent_id="agent_payment_06"
     )
     db.commit()
@@ -142,7 +187,7 @@ async def create_paypal_order(
         status=order_result["status"],
         amount=amount,
         currency="USD",
-        provider=order_result["provider"],
+        provider=provider,
         approval_url=order_result.get("approval_url")
     )
 
@@ -179,7 +224,7 @@ async def capture_paypal_order(
         TransactionModel.paypal_order_id == payload.order_id
     ).first()
 
-    # 1. Prevent duplicate captures (Idempotency Guard)
+    # 1. Prevent duplicate captures (Idempotency Guard preserves historical successful captures)
     if tx and tx.payment_status in ["completed", "simulated_completed"]:
         return OrderCaptureResponse(
             success=True,
@@ -192,6 +237,9 @@ async def capture_paypal_order(
             provider=tx.provider,
             message="Payment was already captured and verified."
         )
+
+    # 2. Shared Positive Server-Side Payment Eligibility Enforcement
+    validate_task_payment_eligibility(task, db, action="capture payment")
 
     expected_amount = task.total_cost or 8.00
 
@@ -264,13 +312,18 @@ async def capture_paypal_order(
     task.status = "paid"
     db.commit()
 
-    # Advance workflow to final delivery automatically!
+    # Advance workflow to final delivery automatically if prior steps are completed
     try:
-        await orchestration_engine.advance_task(db, task.id)
-        # Advance again to execute final_delivery node
-        await orchestration_engine.advance_task(db, task.id)
+        step_delivery = db.query(TaskStepModel).filter(
+            TaskStepModel.task_id == task.id,
+            TaskStepModel.step_name == "final_delivery"
+        ).first()
+        if step_delivery and step_delivery.status == "pending":
+            await orchestration_engine.advance_task(db, task.id)
     except Exception as e:
         logger.error(f"Error auto-advancing deliverable post-payment: {e}")
+        task.status = "paid"
+        db.commit()
 
     log_activity(
         db, task.id, "payment",

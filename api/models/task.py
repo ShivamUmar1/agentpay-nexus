@@ -31,6 +31,19 @@ class TaskModel(Base):
     steps = relationship("TaskStepModel", back_populates="task", cascade="all, delete-orphan", order_by="TaskStepModel.started_at")
     runs = relationship("AgentRunModel", back_populates="task", cascade="all, delete-orphan")
 
+    @property
+    def execution_mode(self) -> str:
+        """Determines whether task was executed with live AI or in offline scaffold mode."""
+        if self.execution_plan:
+            try:
+                import json
+                p = json.loads(self.execution_plan)
+                if isinstance(p, dict) and "execution_mode" in p:
+                    return p["execution_mode"]
+            except Exception:
+                pass
+        return "live_ai"
+
 
 class TaskStepModel(Base):
     __tablename__ = "task_steps"
@@ -115,6 +128,7 @@ class TaskResponse(BaseModel):
     currency: str
     status: str
     current_step: str
+    execution_mode: str = "live_ai"
     execution_plan: Optional[Any] = None
     final_output: Optional[Any] = None
     total_cost: float

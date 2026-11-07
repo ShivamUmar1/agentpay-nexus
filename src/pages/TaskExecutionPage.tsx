@@ -33,7 +33,8 @@ import {
   DollarSign, 
   ArrowRight,
   ExternalLink,
-  Loader2
+  Loader2,
+  Info
 } from 'lucide-react';
 import { Task, TaskStep, ActivityLog, PaymentSummary } from '../types';
 import { api } from '../services/api';
@@ -66,6 +67,7 @@ export const TaskExecutionPage: React.FC = () => {
     message: string;
   } | null>(null);
   const [copied, setCopied] = useState(false);
+  const [executionError, setExecutionError] = useState<string | null>(null);
   const capturingRef = useRef(false);
 
   // Polling ref
@@ -174,11 +176,14 @@ export const TaskExecutionPage: React.FC = () => {
     if (!taskId || advancing) return;
     try {
       setAdvancing(true);
+      setExecutionError(null);
       await api.advanceTask(taskId);
       await loadTaskData();
-    } catch (err) {
+    } catch (err: any) {
       console.error('Advance step failed:', err);
       setAutoRun(false);
+      setExecutionError(err.message || 'Workflow advancement halted.');
+      await loadTaskData();
     } finally {
       setAdvancing(false);
     }
@@ -238,11 +243,34 @@ export const TaskExecutionPage: React.FC = () => {
 
   const isCompleted = task.status === 'completed';
   const isAwaitingPayment = task.status === 'awaiting_payment';
+  const isFailed = task.status === 'failed';
   const chartData = task.final_output?.analysis_data?.chart_revenue_projections || [];
   const marketShareData = task.final_output?.analysis_data?.market_share_breakdown || [];
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
+      {/* Execution Error Banner (429 Quota Exhaustion, 503 Overload, Timeout) */}
+      {(isFailed || executionError) && (
+        <div className="p-4 rounded-xl border bg-rose-500/10 border-rose-500/30 text-rose-300 flex items-start justify-between gap-3 text-xs animate-fadeIn">
+          <div className="flex items-start gap-2.5">
+            <AlertCircle className="w-5 h-5 text-rose-400 mt-0.5 shrink-0" />
+            <div>
+              <span className="font-bold uppercase tracking-wider text-[11px] block text-rose-200">
+                Workflow Execution Halted
+              </span>
+              <span className="mt-1 block text-slate-200 font-sans leading-relaxed">
+                {executionError ||
+                  task.steps.find(s => s.status === 'failed')?.error_message ||
+                  'AI provider quota limit or service degradation encountered. The task has been safely halted and state is preserved.'}
+              </span>
+              <span className="mt-1.5 block text-[10px] font-mono text-slate-400">
+                Task ID: {task.id} • Halted node: {task.current_step} • Payment authorization is locked.
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Payment Notification Banner */}
       {paymentNotice && (
         <div className={`p-4 rounded-xl border flex items-center justify-between gap-3 text-xs animate-fadeIn ${
@@ -281,6 +309,30 @@ export const TaskExecutionPage: React.FC = () => {
         </div>
       )}
 
+      {/* Pre-Payment Deliverable Scope & Review Notice */}
+      {isAwaitingPayment && (
+        <div className="p-4 rounded-xl bg-blue-950/40 border border-blue-500/30 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs animate-fadeIn">
+          <div className="flex items-start gap-2.5">
+            <Info className="w-5 h-5 text-cyan-400 mt-0.5 shrink-0" />
+            <div>
+              <span className="font-bold text-white text-xs block">
+                Deliverable Review Checkpoint — Qualitative AI Intelligence Synthesis
+              </span>
+              <span className="text-slate-300 block mt-0.5 text-[11px] leading-relaxed">
+                Multi-agent workflow is complete and certified for internal consistency. Scope is designated as qualitative AI synthesis with suggested research leads (not independently fact-verified against external primary records).
+              </span>
+            </div>
+          </div>
+          <button
+            onClick={handleOpenPaymentModal}
+            className="px-4 py-2 rounded-xl bg-gradient-to-r from-[#0070BA] to-[#003087] hover:from-[#005ea6] hover:to-[#00256c] text-white font-bold text-xs shrink-0 shadow-md transition-all flex items-center gap-1.5"
+          >
+            <CreditCard className="w-3.5 h-3.5" />
+            <span>Review & Authorize (${task.total_cost.toFixed(2)})</span>
+          </button>
+        </div>
+      )}
+
       {/* Header Bar */}
       <div className="glass-panel rounded-2xl p-5 border border-slate-800 flex flex-col lg:flex-row lg:items-center justify-between gap-4">
         <div>
@@ -290,6 +342,8 @@ export const TaskExecutionPage: React.FC = () => {
                 ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
                 : isAwaitingPayment
                 ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30 animate-pulse'
+                : isFailed
+                ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
                 : 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
             }`}>
               {task.status.replace('_', ' ')}
@@ -315,7 +369,7 @@ export const TaskExecutionPage: React.FC = () => {
           </div>
 
           {/* Stepper / Auto-Run Action */}
-          {!isCompleted && !isAwaitingPayment && (
+          {!isCompleted && !isAwaitingPayment && !isFailed && (
             <div className="flex items-center gap-2">
               <button
                 onClick={() => setAutoRun(!autoRun)}
@@ -406,9 +460,19 @@ export const TaskExecutionPage: React.FC = () => {
                     <CheckCircle2 className="w-4 h-4 text-emerald-400" />
                   </div>
                   <div>
-                    <h3 className="font-bold text-base text-white">Verified Final Deliverable</h3>
+                    <h3 className="font-bold text-base text-white">
+                      {task.final_output.qa_audit?.factual_verification_status === 'VERIFIED_EMPIRICAL'
+                        ? 'Independently Verified Empirical Deliverable'
+                        : task.final_output.qa_audit?.factual_verification_status === 'USER_PROVIDED'
+                        ? 'User-Provided Benchmark Analysis'
+                        : 'Qualitative AI Synthesis Deliverable'}
+                    </h3>
                     <p className="text-[11px] text-slate-400 font-mono">
-                      Unlocked & stamped by QA Auditor. Payment captured.
+                      {task.final_output.qa_audit?.factual_verification_status === 'VERIFIED_EMPIRICAL'
+                        ? 'Empirically verified against primary records • Payment captured.'
+                        : task.final_output.qa_audit?.factual_verification_status === 'USER_PROVIDED'
+                        ? 'Calculated from user inputs (Not externally verified) • Payment captured.'
+                        : 'Internal consistency certified • Suggested leads (Not independently fact-verified)'}
                     </p>
                   </div>
                 </div>
@@ -514,11 +578,39 @@ export const TaskExecutionPage: React.FC = () => {
                       </span>
                     </div>
                     <div className="p-4 rounded-xl bg-navy-950 border border-slate-800 text-center">
-                      <span className="text-xs text-slate-400 font-mono block mb-1">Factual Coherence</span>
+                      <span className="text-xs text-slate-400 font-mono block mb-1">Internal Consistency</span>
                       <span className="text-2xl font-extrabold text-emerald-400 font-mono">
                         {task.final_output.qa_audit?.factual_coherence_score || 96} / 100
                       </span>
+                      <span className="text-[10px] text-slate-500 block mt-0.5">Structural coherence (Internal)</span>
                     </div>
+                  </div>
+
+                  {/* External Verification Scope Disclosure */}
+                  <div className="p-3.5 rounded-xl bg-navy-950 border border-slate-800 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs">
+                    <div>
+                      <span className="text-slate-400 font-mono block text-[11px]">External Factual Verification:</span>
+                      <span className="text-[11px] text-slate-300">
+                        {task.final_output.qa_audit?.factual_verification_status === 'VERIFIED_EMPIRICAL'
+                          ? 'Empirically checked against primary research citations.'
+                          : task.final_output.qa_audit?.factual_verification_status === 'USER_PROVIDED'
+                          ? 'Calculated deterministically from user parameters; not externally verified.'
+                          : 'Qualitative AI synthesis with suggested leads (Not independently verified against external records).'}
+                      </span>
+                    </div>
+                    <span className={`px-2 py-0.5 rounded font-mono font-semibold text-[10px] uppercase shrink-0 ${
+                      task.final_output.qa_audit?.factual_verification_status === 'VERIFIED_EMPIRICAL'
+                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                        : task.final_output.qa_audit?.factual_verification_status === 'USER_PROVIDED'
+                        ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
+                        : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
+                    }`}>
+                      {task.final_output.qa_audit?.factual_verification_status === 'VERIFIED_EMPIRICAL'
+                        ? 'Empirically Verified'
+                        : task.final_output.qa_audit?.factual_verification_status === 'USER_PROVIDED'
+                        ? 'User Benchmark'
+                        : 'Qualitative AI Synthesis'}
+                    </span>
                   </div>
                 </div>
               )}
@@ -546,6 +638,8 @@ export const TaskExecutionPage: React.FC = () => {
                         ? 'bg-emerald-500/20 text-emerald-400 border border-emerald-500/30'
                         : selectedStep.status === 'running'
                         ? 'bg-cyan-500/20 text-cyan-400 border border-cyan-500/30 animate-pulse'
+                        : selectedStep.status === 'failed'
+                        ? 'bg-rose-500/20 text-rose-400 border border-rose-500/30'
                         : 'bg-slate-800 text-slate-400 border border-slate-700'
                     }`}>
                       {selectedStep.status}
@@ -558,7 +652,17 @@ export const TaskExecutionPage: React.FC = () => {
                       Structured Node Payload
                     </span>
                     <div className="bg-navy-950 p-4 rounded-xl border border-slate-800 overflow-x-auto max-h-[350px]">
-                      {selectedStep.output_data ? (
+                      {selectedStep.status === 'failed' ? (
+                        <div className="p-4 rounded-xl bg-rose-950/40 border border-rose-500/40 text-rose-200 space-y-2">
+                          <div className="flex items-center gap-2 text-rose-400 font-bold text-xs uppercase tracking-wider">
+                            <AlertCircle className="w-4 h-4" />
+                            <span>Node Execution Halted</span>
+                          </div>
+                          <p className="text-xs font-mono leading-relaxed">
+                            {selectedStep.error_message || 'AI provider error occurred during this step.'}
+                          </p>
+                        </div>
+                      ) : selectedStep.output_data ? (
                         <pre className="text-[11px] font-mono text-cyan-300 leading-relaxed">
                           {JSON.stringify(selectedStep.output_data, null, 2)}
                         </pre>

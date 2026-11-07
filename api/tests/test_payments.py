@@ -1,6 +1,11 @@
+import json
+from unittest.mock import AsyncMock, patch
 import pytest
 from fastapi.testclient import TestClient
 from api.main import app
+from api.database import SessionLocal
+from api.models.task import TaskModel, TaskStepModel
+from api.services.paypal_service import paypal_service
 
 client = TestClient(app)
 
@@ -24,32 +29,52 @@ def test_payment_lifecycle():
     assert summary["is_budget_exceeded"] is False
     assert len(summary["items"]) == 4
 
-    # 3. Create PayPal order
-    order_res = client.post("/api/payments/paypal/create-order", json={"task_id": task_id})
-    assert order_res.status_code == 200
-    order_data = order_res.json()
-    assert "order_id" in order_data
-    assert order_data["amount"] == 8.00
-    order_id = order_data["order_id"]
+    # Prepare task state in database: simulate completion of all 6 prerequisite steps
+    # with genuine QA approval in live_ai execution mode.
+    db = SessionLocal()
+    try:
+        task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
+        task.status = "awaiting_payment"
+        task.current_step = "payment_approval"
+        task.execution_plan = json.dumps({"execution_mode": "live_ai"})
 
-    # 4. If live order, unapproved capture returns HTTP 400 with ORDER_NOT_APPROVED;
-    # then simulate capture to verify ledger persistence and deliverable unlocking.
+        steps = db.query(TaskStepModel).filter(TaskStepModel.task_id == task_id).all()
+        for s in steps:
+            s.status = "completed"
+            if s.step_name == "quality_assurance":
+                s.output_data = json.dumps({
+                    "audit_status": "APPROVED",
+                    "completeness_score": 95,
+                    "factual_coherence_score": 95,
+                    "constraint_compliance": True,
+                    "budget_compliance": True,
+                    "feedback": "All requirements verified.",
+                    "corrections_required": False
+                })
+        db.commit()
+    finally:
+        db.close()
+
+    # 3. Create PayPal order (mocked to prevent live sandbox order pollution during automated test)
+    mock_order = {
+        "order_id": f"TEST-ORD-{task_id[:8]}",
+        "status": "CREATED",
+        "approval_url": f"https://www.sandbox.paypal.com/checkoutnow?token=TEST-ORD-{task_id[:8]}"
+    }
+    with patch.object(paypal_service, "create_order", new_callable=AsyncMock) as mock_create:
+        mock_create.return_value = mock_order
+        order_res = client.post("/api/payments/paypal/create-order", json={"task_id": task_id})
+        assert order_res.status_code == 200
+        order_data = order_res.json()
+        assert "order_id" in order_data
+        assert order_data["amount"] == 8.00
+
+    # 4. Simulate capture using built-in test order to verify ledger persistence and deliverable unlocking
+    sim_order_id = f"SIM-ORD-{task_id[:8]}"
     cap_res = client.post("/api/payments/paypal/capture-order", json={
         "task_id": task_id,
-        "order_id": order_id
+        "order_id": sim_order_id
     })
-    
-    if cap_res.status_code == 400:
-        # Expected for live PayPal Sandbox order before human buyer approval
-        assert "Capture failed" in cap_res.json()["detail"]
-        # Now test capture lifecycle using test simulated order ID
-        sim_order_id = f"SIM-ORD-{task_id[:8]}"
-        cap_res = client.post("/api/payments/paypal/capture-order", json={
-            "task_id": task_id,
-            "order_id": sim_order_id
-        })
-        order_id = sim_order_id
-
     assert cap_res.status_code == 200
     cap_data = cap_res.json()
     assert cap_data["success"] is True
@@ -58,7 +83,7 @@ def test_payment_lifecycle():
     # 5. Test idempotency (duplicate capture should be safe and return already captured)
     dup_res = client.post("/api/payments/paypal/capture-order", json={
         "task_id": task_id,
-        "order_id": order_id
+        "order_id": sim_order_id
     })
     assert dup_res.status_code == 200
     dup_data = dup_res.json()

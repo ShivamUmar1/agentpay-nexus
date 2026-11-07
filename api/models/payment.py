@@ -47,6 +47,8 @@ class PaymentSummary(BaseModel):
     items: List[InvoiceLineItem]
     is_budget_exceeded: bool = False
     budget: float
+    deliverable_classification: Optional[str] = None
+    factual_verification_status: Optional[str] = None
 
 
 class OrderCreateRequest(BaseModel):

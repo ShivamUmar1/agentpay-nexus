@@ -1,12 +1,189 @@
+import asyncio
+from enum import Enum
 import json
 import logging
 import re
 import time
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import httpx
 from api.config import settings
 
 logger = logging.getLogger(__name__)
+
+
+class ProviderHealthState(str, Enum):
+    NOT_CONFIGURED = "not_configured"
+    NOT_CHECKED = "not_checked"
+    CONFIGURED = "configured"
+    HEALTHY = "healthy"
+    DEGRADED = "degraded"
+    QUOTA_EXHAUSTED = "quota_exhausted"
+
+
+class AIErrorKind(str, Enum):
+    QUOTA_EXHAUSTED = "QUOTA_EXHAUSTED"
+    RATE_LIMIT_TRANSIENT = "RATE_LIMIT_TRANSIENT"
+    AUTH_ERROR = "AUTH_ERROR"
+    MODEL_NOT_FOUND = "MODEL_NOT_FOUND"
+    SERVICE_UNAVAILABLE = "SERVICE_UNAVAILABLE"
+    TIMEOUT = "TIMEOUT"
+    BAD_REQUEST = "BAD_REQUEST"
+    MALFORMED_RESPONSE = "MALFORMED_RESPONSE"
+    PROVIDER_UNAVAILABLE = "PROVIDER_UNAVAILABLE"
+
+
+class AIError(Exception):
+    """Structured AI provider error with classification, user-safe messaging, and retry metadata."""
+
+    def __init__(
+        self,
+        kind: AIErrorKind,
+        message: str,
+        user_message: str,
+        status_code: Optional[int] = None,
+        retry_after: Optional[float] = None,
+        model: Optional[str] = None
+    ):
+        super().__init__(message)
+        self.kind = kind
+        self.message = message
+        self.user_message = user_message
+        self.status_code = status_code
+        self.retry_after = retry_after
+        self.model = model
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "error_kind": self.kind.value,
+            "message": self.message,
+            "user_message": self.user_message,
+            "status_code": self.status_code,
+            "retry_after": self.retry_after,
+            "model": self.model
+        }
+
+
+def parse_retry_delay(text: str, headers: Optional[Dict[str, str]] = None) -> Optional[float]:
+    """Extracts retry delay in seconds from Gemini response body or HTTP headers."""
+    if headers:
+        for k, v in headers.items():
+            if k.lower() == "retry-after":
+                try:
+                    return float(v)
+                except (ValueError, TypeError):
+                    pass
+
+    match = re.search(r'"retryDelay":\s*"(\d+(?:\.\d+)?)s"', text)
+    if match:
+        try:
+            return float(match.group(1))
+        except (ValueError, TypeError):
+            pass
+    return None
+
+
+def classify_gemini_error(
+    status_code: int,
+    response_text: str,
+    headers: Optional[Dict[str, str]] = None,
+    model: Optional[str] = None
+) -> AIError:
+    """Classifies raw Gemini HTTP errors into structured, user-safe AIError instances."""
+    retry_after = parse_retry_delay(response_text, headers)
+    lower_text = response_text.lower()
+
+    if status_code in (401, 403):
+        return AIError(
+            kind=AIErrorKind.AUTH_ERROR,
+            message=f"Gemini authentication failed (HTTP {status_code}): {response_text[:180]}",
+            user_message="AI provider authentication failed. Please verify API key configuration and permissions.",
+            status_code=status_code,
+            model=model
+        )
+
+    if status_code == 404:
+        return AIError(
+            kind=AIErrorKind.MODEL_NOT_FOUND,
+            message=f"Gemini model not found (HTTP 404): {response_text[:180]}",
+            user_message=f"Configured AI model '{model}' was not found or is no longer supported by the provider.",
+            status_code=status_code,
+            model=model
+        )
+
+    if status_code == 503:
+        return AIError(
+            kind=AIErrorKind.SERVICE_UNAVAILABLE,
+            message=f"Gemini service unavailable (HTTP 503): {response_text[:180]}",
+            user_message="AI provider is temporarily overloaded or unavailable. Please retry shortly.",
+            status_code=status_code,
+            retry_after=retry_after or 2.0,
+            model=model
+        )
+
+    if status_code == 429:
+        has_transient_delay = bool(retry_after is not None)
+        has_daily_or_billing_keywords = any(kw in lower_text for kw in [
+            "per day", "daily limit", "daily quota", "billing", "free tier", "spend limit", "project quota", "exceeded your current quota"
+        ])
+        has_rpm_keywords = any(kw in lower_text for kw in [
+            "per minute", "requests per minute", "tokens per minute", "rpm", "tpm", "rate limit"
+        ])
+
+        if has_daily_or_billing_keywords:
+            is_transient = False
+        elif has_transient_delay or has_rpm_keywords:
+            is_transient = True
+        else:
+            is_transient = False
+
+        if is_transient:
+            return AIError(
+                kind=AIErrorKind.RATE_LIMIT_TRANSIENT,
+                message=f"Gemini transient rate limit reached (HTTP 429): {response_text[:180]}",
+                user_message="AI service request rate limit reached. Please wait a moment and retry.",
+                status_code=status_code,
+                retry_after=retry_after,
+                model=model
+            )
+        else:
+            return AIError(
+                kind=AIErrorKind.QUOTA_EXHAUSTED,
+                message=f"Gemini quota exhausted (HTTP 429): {response_text[:180]}",
+                user_message="AI research is temporarily unavailable because the configured AI provider has reached a usage limit. Your task has been preserved. Please retry when AI service availability is restored. No payment has been captured.",
+                status_code=status_code,
+                retry_after=retry_after,
+                model=model
+            )
+
+    return AIError(
+        kind=AIErrorKind.SERVICE_UNAVAILABLE,
+        message=f"Gemini HTTP error {status_code}: {response_text[:180]}",
+        user_message="AI provider encountered an unexpected error. Please retry.",
+        status_code=status_code,
+        model=model
+    )
+
+
+def extract_topic_title(prompt: str) -> str:
+    """Extracts clean topic/title from prompt text."""
+    lines = prompt.strip().split("\n")
+    for line in lines:
+        cleaned = line.strip().lstrip("#").strip()
+        lower = cleaned.lower()
+        if lower.startswith("title:"):
+            return cleaned.split(":", 1)[1].strip()
+        if lower.startswith("task title:"):
+            return cleaned.split(":", 1)[1].strip()
+        if lower.startswith("analyze the research data for:"):
+            return cleaned.split(":", 1)[1].strip()
+        if lower.startswith("generate an executive report on:"):
+            return cleaned.split(":", 1)[1].strip()
+        if lower.startswith("audit the final deliverable for task:"):
+            return cleaned.split(":", 1)[1].strip()
+        if lower.startswith("conduct rigorous market research on:"):
+            continue
+    first = lines[0].strip().lstrip("#").strip()
+    return first[:60] if first else "Market Intelligence Objective"
 
 
 def extract_json(text: str) -> Dict[str, Any]:
@@ -28,7 +205,12 @@ def extract_json(text: str) -> Dict[str, Any]:
 
 
 class LLMProvider:
-    """Central provider abstraction supporting Gemini, OpenAI, and deterministic demo fallback."""
+    """Central provider abstraction supporting Gemini, OpenAI, and truthful status semantics."""
+
+    def __init__(self):
+        self._health_state: ProviderHealthState = ProviderHealthState.NOT_CHECKED
+        self._last_health_check_time: Optional[float] = None
+        self._last_error_message: Optional[str] = None
 
     @property
     def gemini_key(self) -> Optional[str]:
@@ -52,43 +234,67 @@ class LLMProvider:
             return "gemini"
         if self.openai_key:
             return "openai"
-        return "deterministic_fallback"
+        return "offline_scaffold"
+
+    def get_status(self) -> Dict[str, Any]:
+        """Instantaneous diagnostics endpoint reporting truthful configuration without external network overhead."""
+        has_creds = bool(self.gemini_key or self.openai_key)
+
+        if not has_creds:
+            status_val = ProviderHealthState.NOT_CONFIGURED.value
+        elif self._health_state == ProviderHealthState.NOT_CHECKED:
+            status_val = ProviderHealthState.CONFIGURED.value  # Truthful: Credentials present, unverified
+        else:
+            status_val = self._health_state.value
+
+        return {
+            "provider": self.provider_name,
+            "configured_model": self.gemini_model if self.gemini_key else (self.openai_model if self.openai_key else "none"),
+            "fallback_model": settings.GEMINI_FALLBACK_MODEL if self.gemini_key else None,
+            "has_credentials": has_creds,
+            "status": status_val,
+            "health_state": self._health_state.value,
+            "last_checked_timestamp": self._last_health_check_time,
+            "last_error": self._last_error_message,
+            "timeout_seconds": settings.AI_REQUEST_TIMEOUT,
+            "max_budget_seconds": settings.AI_REQUEST_TIMEOUT * 2
+        }
 
     async def generate_text(self, prompt: str, system_instruction: Optional[str] = None) -> str:
-        """Generates text from the configured provider or fallback."""
+        """Generates text from configured provider or raises AIError if live provider fails."""
         if self.gemini_key:
-            try:
-                return await self._call_gemini(prompt, system_instruction, as_json=False)
-            except Exception as e:
-                logger.warning(f"Gemini text call failed: {e}. Falling back to demo generator.")
-                return self._generate_fallback_text(prompt, system_instruction)
+            return await self._call_gemini(prompt, system_instruction, as_json=False)
         elif self.openai_key:
             try:
                 return await self._call_openai(prompt, system_instruction)
             except Exception as e:
-                logger.warning(f"OpenAI text call failed: {e}. Falling back to demo generator.")
-                return self._generate_fallback_text(prompt, system_instruction)
+                self._health_state = ProviderHealthState.DEGRADED
+                raise AIError(
+                    kind=AIErrorKind.SERVICE_UNAVAILABLE,
+                    message=f"OpenAI error: {str(e)[:180]}",
+                    user_message="OpenAI service is temporarily unavailable."
+                )
         return self._generate_fallback_text(prompt, system_instruction)
 
     async def generate_json(self, prompt: str, system_instruction: Optional[str] = None) -> Dict[str, Any]:
-        """Generates structured JSON from the configured provider or fallback."""
+        """Generates structured JSON from configured provider or raises AIError if live provider fails."""
         full_system = (system_instruction or "") + "\n\nCRITICAL: Respond ONLY with a valid JSON object. Do not include introductory or concluding conversational prose."
         
         if self.gemini_key:
-            try:
-                text = await self._call_gemini(prompt, full_system, as_json=True)
-                return extract_json(text)
-            except Exception as e:
-                logger.warning(f"Gemini JSON generation failed: {e}. Falling back to demo generator.")
-                return self._generate_fallback_json(prompt, system_instruction)
+            text = await self._call_gemini(prompt, full_system, as_json=True)
+            return extract_json(text)
         elif self.openai_key:
             try:
                 text = await self._call_openai(prompt, full_system)
                 return extract_json(text)
             except Exception as e:
-                logger.warning(f"OpenAI JSON generation failed: {e}. Falling back to demo generator.")
-                return self._generate_fallback_json(prompt, system_instruction)
-        
+                self._health_state = ProviderHealthState.DEGRADED
+                raise AIError(
+                    kind=AIErrorKind.SERVICE_UNAVAILABLE,
+                    message=f"OpenAI error: {str(e)[:180]}",
+                    user_message="OpenAI service is temporarily unavailable."
+                )
+
         return self._generate_fallback_json(prompt, system_instruction)
 
     async def _call_gemini(
@@ -99,19 +305,20 @@ class LLMProvider:
     ) -> str:
         key = self.gemini_key
         if not key:
-            raise ValueError("GEMINI_API_KEY is not configured.")
+            self._health_state = ProviderHealthState.NOT_CONFIGURED
+            raise AIError(
+                kind=AIErrorKind.PROVIDER_UNAVAILABLE,
+                message="GEMINI_API_KEY is not configured.",
+                user_message="AI service is not configured."
+            )
 
         primary_model = self.gemini_model
-        # Build candidate fallback models list
-        candidate_models = [primary_model]
-        for fallback in ["gemini-3.8-flash", "gemini-3-flash-preview", "gemini-flash-latest"]:
-            if fallback not in candidate_models:
-                candidate_models.append(fallback)
-        
-        contents = [
-            {"role": "user", "parts": [{"text": prompt}]}
-        ]
+        fallback_model = settings.GEMINI_FALLBACK_MODEL
+        models_to_try = [primary_model]
+        if fallback_model and fallback_model != primary_model:
+            models_to_try.append(fallback_model)
 
+        contents = [{"role": "user", "parts": [{"text": prompt}]}]
         payload: Dict[str, Any] = {
             "contents": contents,
             "generationConfig": {
@@ -119,48 +326,118 @@ class LLMProvider:
                 "maxOutputTokens": 4096
             }
         }
-
         if system_instruction:
             payload["system_instruction"] = {
                 "parts": [{"text": system_instruction}]
             }
-
         if as_json:
             payload["generationConfig"]["responseMimeType"] = "application/json"
 
-        last_error = None
+        last_error: Optional[AIError] = None
+        timeout_val = settings.AI_REQUEST_TIMEOUT
+
         async with httpx.AsyncClient() as client:
-            for model in candidate_models:
+            for idx, model in enumerate(models_to_try):
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
-                timeout_val = 15.0 if model == "gemini-3.8-flash" else 25.0
                 try:
                     response = await client.post(url, json=payload, timeout=timeout_val)
-                    if response.status_code in [404, 503, 429]:
-                        logger.warning(f"Gemini model {model} returned HTTP {response.status_code}; cascading to next model...")
-                        last_error = f"HTTP {response.status_code}: {response.text[:200]}"
-                        continue
-                    response.raise_for_status()
-                    data = response.json()
-                    candidates = data.get("candidates", [])
-                    if candidates and "content" in candidates[0]:
-                        parts = candidates[0]["content"].get("parts", [])
-                        if parts and "text" in parts[0]:
-                            return parts[0]["text"]
-                    raise ValueError(f"Unexpected response structure from Gemini: {data}")
-                except (httpx.TimeoutException, httpx.ConnectTimeout):
-                    logger.warning(f"Gemini model {model} timed out; cascading to next model...")
-                    last_error = f"Model {model} timed out"
-                    continue
-                except httpx.HTTPStatusError as e:
-                    last_error = f"Gemini API HTTP Error {e.response.status_code}: {e.response.text}"
-                    logger.error(last_error)
-                    continue
-                except Exception as e:
-                    last_error = str(e)
-                    logger.error(f"Gemini execution error on {model}: {e}")
+                    if response.status_code == 200:
+                        data = response.json()
+                        candidates = data.get("candidates", [])
+                        if candidates and "content" in candidates[0]:
+                            parts = candidates[0]["content"].get("parts", [])
+                            if parts and "text" in parts[0]:
+                                self._health_state = ProviderHealthState.HEALTHY
+                                self._last_health_check_time = time.time()
+                                return parts[0]["text"]
+                        raise AIError(
+                            kind=AIErrorKind.MALFORMED_RESPONSE,
+                            message=f"Gemini model {model} returned unexpected structure: {str(data)[:200]}",
+                            user_message="AI provider returned an unparseable response structure.",
+                            status_code=200,
+                            model=model
+                        )
+
+                    # Classify error
+                    err = classify_gemini_error(
+                        status_code=response.status_code,
+                        response_text=response.text,
+                        headers=dict(response.headers),
+                        model=model
+                    )
+
+                    # Update internal health state
+                    self._last_health_check_time = time.time()
+                    self._last_error_message = err.user_message
+
+                    if err.kind == AIErrorKind.QUOTA_EXHAUSTED:
+                        self._health_state = ProviderHealthState.QUOTA_EXHAUSTED
+                        logger.warning(f"Gemini QUOTA_EXHAUSTED on model {model}. Halting without cascading.")
+                        raise err
+
+                    if err.kind == AIErrorKind.AUTH_ERROR:
+                        self._health_state = ProviderHealthState.DEGRADED
+                        logger.warning(f"Gemini AUTH_ERROR on model {model}. Halting.")
+                        raise err
+
+                    # Transient RPM rate limit: if retry_after <= 2.0s and on primary model, wait and retry once
+                    if err.kind == AIErrorKind.RATE_LIMIT_TRANSIENT and err.retry_after and err.retry_after <= 2.0 and idx == 0:
+                        logger.info(f"Transient rate limit on {model}; waiting {err.retry_after}s before retry...")
+                        await asyncio.sleep(err.retry_after)
+                        retry_resp = await client.post(url, json=payload, timeout=timeout_val)
+                        if retry_resp.status_code == 200:
+                            data = retry_resp.json()
+                            candidates = data.get("candidates", [])
+                            if candidates and "content" in candidates[0]:
+                                parts = candidates[0]["content"].get("parts", [])
+                                if parts and "text" in parts[0]:
+                                    self._health_state = ProviderHealthState.HEALTHY
+                                    return parts[0]["text"]
+                        err = classify_gemini_error(
+                            status_code=retry_resp.status_code,
+                            response_text=retry_resp.text,
+                            headers=dict(retry_resp.headers),
+                            model=model
+                        )
+
+                    self._health_state = ProviderHealthState.DEGRADED
+                    logger.warning(f"Gemini model {model} failed with {err.kind.value}; checking fallback model...")
+                    last_error = err
                     continue
 
-        raise RuntimeError(f"All Gemini models exhausted. Last error: {last_error}")
+                except httpx.TimeoutException:
+                    self._health_state = ProviderHealthState.DEGRADED
+                    self._last_health_check_time = time.time()
+                    logger.warning(f"Gemini model {model} timed out after {timeout_val}s.")
+                    last_error = AIError(
+                        kind=AIErrorKind.TIMEOUT,
+                        message=f"Gemini model {model} timed out after {timeout_val}s.",
+                        user_message="AI provider request timed out. Please retry.",
+                        model=model
+                    )
+                    continue
+
+                except AIError:
+                    raise
+
+                except Exception as ex:
+                    self._health_state = ProviderHealthState.DEGRADED
+                    logger.error(f"Unexpected error calling Gemini on {model}: {ex}")
+                    last_error = AIError(
+                        kind=AIErrorKind.SERVICE_UNAVAILABLE,
+                        message=f"Unexpected error: {str(ex)[:180]}",
+                        user_message="AI service encountered an unexpected error.",
+                        model=model
+                    )
+                    continue
+
+        if last_error:
+            raise last_error
+        raise AIError(
+            kind=AIErrorKind.SERVICE_UNAVAILABLE,
+            message="All configured Gemini models failed.",
+            user_message="AI service is currently unavailable. Please retry later."
+        )
 
     async def _call_openai(self, prompt: str, system_instruction: Optional[str] = None) -> str:
         url = "https://api.openai.com/v1/chat/completions"
@@ -180,20 +457,22 @@ class LLMProvider:
             "max_tokens": 4096
         }
 
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=10.0) as client:
             response = await client.post(url, headers=headers, json=payload)
             response.raise_for_status()
             data = response.json()
+            self._health_state = ProviderHealthState.HEALTHY
             return data["choices"][0]["message"]["content"]
 
     async def test_connection(self) -> Dict[str, Any]:
-        """Tests live inference with the configured provider and reports latency and status."""
+        """Bounded single-ping live inference test with a maximum 3.0s timeout."""
         if not self.gemini_key and not self.openai_key:
+            self._health_state = ProviderHealthState.NOT_CONFIGURED
             return {
-                "status": "demo_fallback",
-                "provider": "deterministic_fallback",
-                "model": "deterministic_engine_v1",
-                "message": "No external AI credentials configured; using deterministic fallback engine."
+                "status": ProviderHealthState.NOT_CONFIGURED.value,
+                "provider": "offline_scaffold",
+                "model": "none",
+                "message": "No external AI credentials configured; using offline structural scaffold."
             }
         
         provider = self.provider_name
@@ -201,58 +480,81 @@ class LLMProvider:
         t0 = time.time()
         try:
             if provider == "gemini":
-                res = await self._call_gemini("Respond with 'OK' only.", system_instruction="Output 'OK' only.")
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={self.gemini_key}"
+                payload = {
+                    "contents": [{"role": "user", "parts": [{"text": "Respond with OK only."}]}],
+                    "generationConfig": {"temperature": 0.0, "maxOutputTokens": 10}
+                }
+                async with httpx.AsyncClient(timeout=3.0) as client:
+                    resp = await client.post(url, json=payload)
+                    self._last_health_check_time = time.time()
+                    if resp.status_code != 200:
+                        err = classify_gemini_error(resp.status_code, resp.text, dict(resp.headers), model)
+                        self._health_state = ProviderHealthState.QUOTA_EXHAUSTED if err.kind == AIErrorKind.QUOTA_EXHAUSTED else ProviderHealthState.DEGRADED
+                        self._last_error_message = err.user_message
+                        return {
+                            "status": self._health_state.value,
+                            "provider": provider,
+                            "model": model,
+                            "error_kind": err.kind.value,
+                            "error": err.user_message
+                        }
+                    res = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+                    self._health_state = ProviderHealthState.HEALTHY
             elif provider == "openai":
                 res = await self._call_openai("Respond with 'OK' only.", system_instruction="Output 'OK' only.")
+                self._health_state = ProviderHealthState.HEALTHY
             else:
-                return {
-                    "status": "demo_fallback",
-                    "provider": "deterministic_fallback",
-                    "model": "deterministic_engine_v1",
-                    "message": "No external AI credentials configured; using deterministic fallback engine."
-                }
+                return self.get_status()
+
             latency = round((time.time() - t0) * 1000, 1)
             return {
-                "status": "connected",
+                "status": ProviderHealthState.HEALTHY.value,
                 "provider": provider,
                 "model": model,
                 "latency_ms": latency,
                 "sample_response": res.strip()[:60]
             }
         except Exception as e:
+            self._health_state = ProviderHealthState.DEGRADED
+            self._last_health_check_time = time.time()
+            self._last_error_message = str(e)[:180]
             return {
-                "status": "error",
+                "status": ProviderHealthState.DEGRADED.value,
                 "provider": provider,
                 "model": model,
-                "error": str(e)
+                "error": str(e)[:180]
             }
 
     def _generate_fallback_text(self, prompt: str, system_instruction: Optional[str] = None) -> str:
-        """Deterministic high-quality fallback text when API keys are not supplied."""
+        """Deterministic structural fallback text with zero fabricated figures."""
+        topic = extract_topic_title(prompt)
         return (
-            "# Executive Analysis Dossier\n\n"
-            "> **Notice**: Generated via AgentPay Nexus Deterministic Fallback Intelligence Engine.\n\n"
-            f"### Primary Analysis for Query: {prompt[:120]}...\n\n"
-            "This synthesized market intelligence report evaluates sector macro drivers, competitive benchmarks, "
-            "unit economics, and projected growth vectors based on validated economic baselines."
+            f"# Executive Intelligence Report: {topic}\n\n"
+            "> **Notice**: Generated via AgentPay Nexus Offline Structural Scaffold. Requires active AI credentials for live external generation.\n\n"
+            f"### Primary Domain Outline for: {topic}\n\n"
+            "This structural scaffold establishes domain categories, macro analytical frameworks, "
+            "and governance checklists. Quantitative metrics and empirical projections are unavailable in offline mode."
         )
 
     def _generate_fallback_json(self, prompt: str, system_instruction: Optional[str] = None) -> Dict[str, Any]:
-        """Deterministic realistic JSON outputs based on prompt context."""
+        """Topic-aware structural JSON fallback with ZERO fabricated numbers, market shares, or charts."""
         lower_prompt = prompt.lower()
+        topic = extract_topic_title(prompt)
         
-        # If prompt is for planning
+        # Subtask planning
         if "plan" in lower_prompt or "subtask" in lower_prompt or "orchestrat" in lower_prompt:
             return {
-                "objective_summary": "Comprehensive multi-agent execution pipeline covering deep market research, quantitative analytics, executive synthesis, and quality auditing.",
-                "complexity_tier": "High",
+                "objective_summary": f"Execution pipeline for '{topic[:60]}' covering deep research, analytics, synthesis, and QA auditing.",
+                "complexity_tier": "Standard",
                 "estimated_total_cost": 8.00,
+                "execution_mode": "offline_scaffold",
                 "subtasks": [
                     {
                         "step_name": "research",
                         "assigned_agent_id": "agent_research_01",
                         "agent_category": "Research",
-                        "objective": "Gather domain fundamentals, market sizing, key players, regulatory drivers, and historical growth baselines.",
+                        "objective": f"Gather domain fundamentals and key players for {topic[:40]}.",
                         "dependencies": ["planning"],
                         "estimated_cost": 2.00
                     },
@@ -260,7 +562,7 @@ class LLMProvider:
                         "step_name": "data_analysis",
                         "assigned_agent_id": "agent_analysis_02",
                         "agent_category": "Analytics",
-                        "objective": "Compute CAGR, market share distributions, revenue trajectories, and chart-ready quantitative datasets.",
+                        "objective": f"Audit quantitative metrics and evaluate CAGR feasibility for {topic[:40]}.",
                         "dependencies": ["research"],
                         "estimated_cost": 3.00
                     },
@@ -268,7 +570,7 @@ class LLMProvider:
                         "step_name": "content_generation",
                         "assigned_agent_id": "agent_content_03",
                         "agent_category": "Content",
-                        "objective": "Synthesize research and analytical findings into an executive-grade Markdown deliverable.",
+                        "objective": f"Synthesize findings into an executive Markdown deliverable for {topic[:40]}.",
                         "dependencies": ["data_analysis"],
                         "estimated_cost": 2.00
                     },
@@ -276,94 +578,79 @@ class LLMProvider:
                         "step_name": "quality_assurance",
                         "assigned_agent_id": "agent_qa_04",
                         "agent_category": "Verification",
-                        "objective": "Audit deliverable completeness, check compliance with user budget & constraints, and issue verification certification.",
+                        "objective": f"Audit deliverable completeness and compliance for {topic[:40]}.",
                         "dependencies": ["content_generation"],
                         "estimated_cost": 1.00
                     }
-                ]
+                ],
+                "_disclosure": "Generated via AgentPay Nexus Offline Structural Scaffold. Requires active AI credentials for live external generation."
             }
 
-        # If prompt is for research
+        # Market research
         if "research" in lower_prompt or "market size" in lower_prompt:
             return {
-                "market_overview": "Rapidly expanding ecosystem driven by supportive regulatory frameworks, falling battery pack costs, and high localization mandates.",
-                "market_size_current": "$3.21 Billion (2024)",
-                "market_size_forecast": "$113.99 Billion (2030)",
-                "cagr_projected": "49.0%",
-                "major_competitors": [
-                    {"name": "Tata Motors", "market_share": "68%", "segment": "Passenger Vehicles (Nexon, Tiago, Punch EV)"},
-                    {"name": "Ola Electric", "market_share": "34%", "segment": "2-Wheeler (S1 Series, Gigafactory)"},
-                    {"name": "TVS Motor", "market_share": "19%", "segment": "2-Wheeler (iQube)"},
-                    {"name": "Mahindra & Mahindra", "market_share": "11%", "segment": "Passenger & Commercial (XUV400)"},
-                    {"name": "Ather Energy", "market_share": "12%", "segment": "Premium 2-Wheeler (450X, Apex)"}
-                ],
+                "market_overview": f"Domain landscape outline for '{topic}'. Evaluation identifies emerging technology patterns and regulatory standards.",
+                "market_size_current": "Unavailable (Requires Live Research)",
+                "market_size_forecast": "Unavailable (Requires Live Research)",
+                "cagr_projected": None,
+                "major_competitors": [],
                 "growth_drivers": [
-                    "Government subsidies under FAME-II & EMPS schemes",
-                    "Battery pack cost declining below $100/kWh globally",
-                    "Surging urban commercial fleet adoption (last-mile delivery)",
-                    "Expansion of public DC fast-charging network corridors"
+                    f"Structural domain integration in {topic[:30]}",
+                    "Enterprise demand for process reliability and automation",
+                    "Compliance and governance operational standards"
                 ],
                 "challenges": [
-                    "Charging infrastructure density in tier-2/tier-3 cities",
-                    "Higher upfront consumer acquisition cost vs ICE vehicles",
-                    "Grid infrastructure readiness and peak demand management"
+                    "Empirical data verification constraints",
+                    "Regulatory harmonization across jurisdictions"
                 ],
                 "sources": [
-                    {"source": "Society of Indian Automobile Manufacturers (SIAM)", "reliability": "High"},
-                    {"source": "NITI Aayog National Mission on Transformative Mobility", "reliability": "High"},
-                    {"source": "Vahan National Vehicle Registry Data 2024", "reliability": "Verified"}
-                ]
+                    {"source": "Structural Scaffold Framework (Offline Mode)", "reliability": "Scaffold"}
+                ],
+                "_disclosure": "Generated via AgentPay Nexus Offline Structural Scaffold. Requires active AI credentials for live external generation.",
+                "execution_mode": "offline_scaffold"
             }
 
-        # If prompt is for data analysis
+        # Data analysis
         if "analysis" in lower_prompt or "cagr" in lower_prompt or "quantitative" in lower_prompt:
             return {
                 "computed_metrics": {
-                    "base_year_revenue_usd_bn": 3.21,
-                    "target_year_revenue_usd_bn": 113.99,
-                    "cagr_percent": 49.0,
-                    "ev_penetration_rate_2024": "6.8%",
-                    "ev_penetration_target_2030": "30.0%"
+                    "base_year_revenue_usd_bn": None,
+                    "target_year_revenue_usd_bn": None,
+                    "cagr_percent": None,
+                    "status": "unavailable",
+                    "message": "Quantitative metrics unavailable in offline scaffold mode. Live AI research is required for empirical calculations."
                 },
-                "market_share_breakdown": [
-                    {"label": "Tata Motors", "value": 68.0, "category": "4-Wheeler"},
-                    {"label": "Mahindra & Mahindra", "value": 11.0, "category": "4-Wheeler"},
-                    {"label": "MG Motor India", "value": 10.5, "category": "4-Wheeler"},
-                    {"label": "Others (BYD, Hyundai)", "value": 10.5, "category": "4-Wheeler"}
-                ],
-                "chart_revenue_projections": [
-                    {"year": "2024", "revenue_bn": 3.21, "volume_units_k": 1530},
-                    {"year": "2025", "revenue_bn": 5.45, "volume_units_k": 2450},
-                    {"year": "2026", "revenue_bn": 9.80, "volume_units_k": 3900},
-                    {"year": "2027", "revenue_bn": 18.20, "volume_units_k": 6200},
-                    {"year": "2028", "revenue_bn": 35.50, "volume_units_k": 9800},
-                    {"year": "2029", "revenue_bn": 65.00, "volume_units_k": 14500},
-                    {"year": "2030", "revenue_bn": 113.99, "volume_units_k": 21000}
-                ],
+                "market_share_breakdown": [],
+                "chart_revenue_projections": [],
                 "key_findings": [
-                    "2-Wheeler and 3-Wheeler segments reach Total Cost of Ownership (TCO) parity faster than passenger vehicles.",
-                    "Commercial fleet operators achieve positive ROI within 14 months at average daily usage of 120km.",
-                    "Domestic battery cell manufacturing capacity is projected to reduce unit production cost by 22% by 2027."
-                ]
+                    f"Quantitative baseline metrics unavailable for '{topic[:30]}' in offline scaffold mode.",
+                    "Empirical financial projections deferred until verified research data is supplied."
+                ],
+                "_disclosure": "Generated via AgentPay Nexus Offline Structural Scaffold.",
+                "execution_mode": "offline_scaffold"
             }
 
-        # If prompt is for QA
+        # QA
         if "quality" in lower_prompt or "qa" in lower_prompt or "audit" in lower_prompt:
             return {
-                "audit_status": "APPROVED",
-                "completeness_score": 98,
-                "factual_coherence_score": 96,
-                "constraint_compliance": True,
+                "audit_status": "OFFLINE_SCAFFOLD",
+                "completeness_score": 0,
+                "factual_coherence_score": 0,
+                "constraint_compliance": False,
                 "budget_compliance": True,
-                "feedback": "Deliverable satisfies all primary user requirements: market size, major competitors, quantitative metrics, charts, and strategic opportunities are thoroughly verified.",
-                "corrections_required": False
+                "feedback": "Offline structural scaffold generated without live AI models. Not eligible for payment or production deliverable approval.",
+                "corrections_required": True,
+                "is_payment_eligible": False,
+                "_disclosure": "Generated via AgentPay Nexus Offline Structural Scaffold."
             }
 
         # Default fallback JSON
         return {
-            "status": "success",
-            "message": "Processed through AgentPay Nexus Intelligence Engine",
-            "data": {"sample_query": prompt[:80]}
+            "status": "offline_scaffold",
+            "message": f"Processed through AgentPay Nexus Structural Scaffold for '{topic[:40]}'",
+            "data": {"topic": topic[:80]},
+            "_disclosure": "Generated via AgentPay Nexus Offline Structural Scaffold.",
+            "execution_mode": "offline_scaffold"
         }
 
 

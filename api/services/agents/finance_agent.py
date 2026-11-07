@@ -42,6 +42,24 @@ class FinanceAgent:
         total_amount = subtotal  # zero platform surcharge for transparent ledger
         is_exceeded = total_amount > budget
 
+        classification = "Qualitative AI Synthesis"
+        verification_status = "QUALITATIVE_SYNTHESIS"
+        try:
+            from api.models.task import TaskStepModel
+            import json
+            qa_step = db.query(TaskStepModel).filter(
+                TaskStepModel.task_id == task_id,
+                TaskStepModel.step_name == "quality_assurance"
+            ).first()
+            if qa_step and qa_step.output_data:
+                qa_data = json.loads(qa_step.output_data)
+                if qa_data.get("deliverable_classification"):
+                    classification = qa_data["deliverable_classification"]
+                if qa_data.get("factual_verification_status"):
+                    verification_status = qa_data["factual_verification_status"]
+        except Exception:
+            pass
+
         return PaymentSummary(
             task_id=task_id,
             task_title=task_title,
@@ -51,5 +69,7 @@ class FinanceAgent:
             currency="USD",
             items=items,
             is_budget_exceeded=is_exceeded,
-            budget=budget
+            budget=budget,
+            deliverable_classification=classification,
+            factual_verification_status=verification_status
         )

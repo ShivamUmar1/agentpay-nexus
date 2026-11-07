@@ -67,7 +67,7 @@ def get_task_results(task_id: str, db: Session = Depends(get_db)):
     if not task:
         raise HTTPException(status_code=404, detail="Task not found.")
 
-    is_unlocked = task.status == "completed" or (task.final_output is not None)
+    is_unlocked = task.status in ["completed", "paid"]
     
     return {
         "task_id": task.id,

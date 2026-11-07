@@ -70,6 +70,11 @@ export interface Task {
       completeness_score: number;
       factual_coherence_score: number;
       feedback: string;
+      factual_verification_status?: string;
+      verification_scope?: string;
+      deliverable_classification?: string;
+      external_verification_performed?: boolean;
+      verification_disclaimer?: string;
     };
     invoice?: any;
     delivered_at?: string;
@@ -100,6 +105,8 @@ export interface PaymentSummary {
   items: InvoiceLineItem[];
   is_budget_exceeded: boolean;
   budget: number;
+  deliverable_classification?: string;
+  factual_verification_status?: string;
 }
 
 export interface Transaction {

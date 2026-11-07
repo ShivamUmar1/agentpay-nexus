@@ -7,7 +7,13 @@ async function handleResponse<T>(res: Response): Promise<T> {
     let errorDetail = res.statusText;
     try {
       const errJson = await res.json();
-      errorDetail = errJson.detail || JSON.stringify(errJson);
+      if (typeof errJson.detail === 'string') {
+        errorDetail = errJson.detail;
+      } else if (errJson.detail && typeof errJson.detail === 'object') {
+        errorDetail = errJson.detail.message || JSON.stringify(errJson.detail);
+      } else {
+        errorDetail = JSON.stringify(errJson);
+      }
     } catch {
       // ignore
     }

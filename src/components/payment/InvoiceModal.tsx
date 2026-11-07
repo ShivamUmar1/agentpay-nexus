@@ -91,6 +91,29 @@ export const InvoiceModal: React.FC<InvoiceModalProps> = ({
           </button>
         </div>
 
+        {/* Deliverable Classification Notice */}
+        <div className="mt-3 p-3 rounded-xl bg-navy-950 border border-slate-800 text-xs">
+          <div className="flex items-center justify-between font-mono mb-1">
+            <span className="text-[10px] uppercase text-slate-400">Deliverable Classification:</span>
+            <span className={`font-semibold text-[11px] ${
+              summary.factual_verification_status === 'VERIFIED_EMPIRICAL'
+                ? 'text-emerald-400'
+                : summary.factual_verification_status === 'USER_PROVIDED'
+                ? 'text-cyan-400'
+                : 'text-amber-400'
+            }`}>
+              {summary.deliverable_classification || 'Qualitative AI Synthesis'}
+            </span>
+          </div>
+          <p className="text-[11px] text-slate-400 leading-relaxed">
+            {summary.factual_verification_status === 'VERIFIED_EMPIRICAL'
+              ? 'Independently checked against empirical research citations.'
+              : summary.factual_verification_status === 'USER_PROVIDED'
+              ? 'Calculated deterministically from user-provided input parameters; not independently fact-verified by external primary records.'
+              : 'Audited for internal consistency and scope compliance. Research organizations are included as suggested leads, not independently verified empirical citations.'}
+          </p>
+        </div>
+
         {/* Budget Warning if Exceeded */}
         {summary.is_budget_exceeded && (
           <div className="mt-4 p-3 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-start gap-2.5 text-xs text-amber-300">

@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from api.database import get_db
 from api.models.task import TaskModel, TaskStepModel, TaskCreateRequest, TaskResponse, TaskListResponse, StepResponse
 from api.services.orchestrator import orchestration_engine
+from api.services.llm_provider import AIError, AIErrorKind
 
 router = APIRouter(prefix="/api/tasks", tags=["Tasks"])
 
@@ -20,8 +21,17 @@ def get_current_user_id(authorization: Optional[str] = Header(None)) -> str:
 
 
 def format_task_response(task: TaskModel) -> TaskResponse:
+    is_unlocked = task.status in ["completed", "paid"]
     steps_formatted = []
     for s in task.steps:
+        step_output = json.loads(s.output_data) if s.output_data else None
+        # Server-side deliverable protection: Mask intermediate content report if not unlocked
+        if not is_unlocked and s.step_name == "content_generation" and isinstance(step_output, dict):
+            if "report_markdown" in step_output:
+                step_output = dict(step_output)
+                step_output["report_markdown"] = "[PROTECTED DELIVERABLE: Locked pending verified PayPal settlement.]"
+                step_output["is_locked"] = True
+
         steps_formatted.append(
             StepResponse(
                 id=s.id,
@@ -30,7 +40,7 @@ def format_task_response(task: TaskModel) -> TaskResponse:
                 assigned_agent_id=s.assigned_agent_id,
                 dependencies=json.loads(s.dependencies or "[]"),
                 input_data=json.loads(s.input_data) if s.input_data else None,
-                output_data=json.loads(s.output_data) if s.output_data else None,
+                output_data=step_output,
                 status=s.status,
                 error_message=s.error_message,
                 started_at=s.started_at,
@@ -47,8 +57,9 @@ def format_task_response(task: TaskModel) -> TaskResponse:
         currency=task.currency,
         status=task.status,
         current_step=task.current_step,
+        execution_mode=task.execution_mode,
         execution_plan=json.loads(task.execution_plan) if task.execution_plan else None,
-        final_output=json.loads(task.final_output) if task.final_output else None,
+        final_output=json.loads(task.final_output) if (task.final_output and is_unlocked) else None,
         total_cost=task.total_cost,
         created_at=task.created_at,
         updated_at=task.updated_at,
@@ -63,16 +74,26 @@ async def create_task(
     user_id: str = Depends(get_current_user_id)
 ):
     """Submits a new task objective and triggers multi-agent planning."""
-    task = await orchestration_engine.create_and_plan_task(
-        db=db,
-        user_id=user_id,
-        title=payload.title,
-        description=payload.description,
-        budget=payload.budget,
-        currency=payload.currency,
-        constraints=payload.constraints
-    )
-    return format_task_response(task)
+    try:
+        task = await orchestration_engine.create_and_plan_task(
+            db=db,
+            user_id=user_id,
+            title=payload.title,
+            description=payload.description,
+            budget=payload.budget,
+            currency=payload.currency,
+            constraints=payload.constraints
+        )
+        return format_task_response(task)
+    except AIError as ai_err:
+        status_code = 429 if ai_err.kind == AIErrorKind.QUOTA_EXHAUSTED else 503
+        raise HTTPException(
+            status_code=status_code,
+            detail={
+                "error_kind": ai_err.kind.value,
+                "message": ai_err.user_message
+            }
+        )
 
 
 @router.get("", response_model=TaskListResponse)
@@ -112,8 +133,20 @@ async def advance_task_step(
     user_id: str = Depends(get_current_user_id)
 ):
     """Advances the task by 1 bounded workflow step (Vercel serverless friendly)."""
-    result = await orchestration_engine.advance_task(db=db, task_id=task_id)
-    return result
+    try:
+        result = await orchestration_engine.advance_task(db=db, task_id=task_id)
+        return result
+    except AIError as ai_err:
+        status_code = 429 if ai_err.kind == AIErrorKind.QUOTA_EXHAUSTED else 503
+        raise HTTPException(
+            status_code=status_code,
+            detail={
+                "error_kind": ai_err.kind.value,
+                "message": ai_err.user_message,
+                "task_id": task_id,
+                "status": "failed"
+            }
+        )
 
 
 @router.post("/{task_id}/cancel")
