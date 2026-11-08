@@ -115,19 +115,31 @@ def get_db_context() -> Generator[Session, None, None]:
 
 
 def init_db():
-    """Initializes database tables and seeds default marketplace agents on primary engine."""
+    """Initializes database tables and seeds default marketplace agents on primary engine.
+    In hosted/production environments, skips runtime DDL on cold starts (schema managed via migrations).
+    """
+    import api.models  # noqa: F401 - ensure all models are registered on Base
     from api.seed_data import seed_marketplace_agents
     
-    # Try primary engine
+    if settings.APP_ENV == "production" or os.environ.get("VERCEL"):
+        # In hosted/production serverless environments, avoid concurrent DDL execution on cold starts.
+        # Production database schema is provisioned via explicit SQL migrations.
+        try:
+            with SessionLocal() as db:
+                from api.models.agent import AgentModel
+                if db.query(AgentModel).count() == 0:
+                    seed_marketplace_agents(db)
+        except Exception as seed_err:
+            logger.warning(f"Production agent seed check skipped: {seed_err}")
+        return
+
+    # Try primary engine for local / test environments
     try:
         Base.metadata.create_all(bind=engine)
         with SessionLocal() as db:
             seed_marketplace_agents(db)
         logger.info("Database initialized successfully on primary engine.")
     except Exception as e:
-        if settings.APP_ENV == "production" or os.environ.get("VERCEL"):
-            logger.error(f"Primary engine init_db failed in production: {e}")
-            raise RuntimeError(f"PostgreSQL initialization failed in production: {e}")
         logger.warning(f"Primary engine init_db failed: {e}. Initializing fallback engine.")
         Base.metadata.create_all(bind=fallback_engine)
         with FallbackSessionLocal() as db:

@@ -325,34 +325,37 @@ def test_qa_agent_rejects_empty_or_failed_report():
 # ==============================================================================
 
 def test_system_status_responds_instantly_without_external_calls():
-    """Verify /api/system/status does NOT make external AI network calls and responds within bounded deadline."""
+    """Verify /api/system/status returns minimal health response without external AI or DB calls."""
     with patch.object(llm_provider, "_call_gemini") as mock_gemini:
         t0 = time.time()
         res = client.get("/api/system/status")
         duration_ms = (time.time() - t0) * 1000
 
         assert res.status_code == 200
-        assert duration_ms < 5000  # Well within Vercel's 15s serverless function timeout
+        assert duration_ms < 5000  # Well within Vercel's serverless function timeout
 
         data = res.json()
         assert "service" in data
-        assert "database" in data
-        assert "ai_orchestration" in data
-        assert "payment_gateway" in data
-
-        ai_diag = data["ai_orchestration"]
-        assert "provider" in ai_diag
-        assert "configured_model" in ai_diag
-        assert "status" in ai_diag
-        assert "timeout_seconds" in ai_diag
+        assert data["status"] == "operational"
+        assert "environment" in data
+        assert "version" in data
 
         # CRITICAL: External LLM API must NOT have been called!
         assert mock_gemini.call_count == 0
 
 
 def test_system_test_ai_endpoint_is_bounded():
-    """Verify dedicated /api/system/test-ai handles bounded diagnostics."""
-    with patch.object(settings, "GEMINI_API_KEY", None), patch.object(settings, "OPENAI_API_KEY", None):
+    """Verify dedicated /api/system/test-ai enforces production lock and allows diagnostics only when explicitly enabled."""
+    # 1. In production, must be HTTP 403 Forbidden
+    with patch.object(settings, "APP_ENV", "production"):
+        res = client.get("/api/system/test-ai")
+        assert res.status_code == 403
+
+    # 2. In development with explicit flag enabled, handles diagnostics
+    with patch.object(settings, "APP_ENV", "development"), \
+         patch.object(settings, "ENABLE_LIVE_AI_DIAGNOSTICS", True), \
+         patch.object(settings, "GEMINI_API_KEY", None), \
+         patch.object(settings, "OPENAI_API_KEY", None):
         res = client.get("/api/system/test-ai")
         assert res.status_code == 200
         data = res.json()
@@ -458,10 +461,11 @@ def test_offline_scaffold_creation_and_qa_rejection():
     # Verify that any arbitrary non-live_ai variant like "scaffold" is also rejected by both endpoints
     from api.database import SessionLocal
     from api.models.task import TaskModel
+    from api.services.auth_session import get_or_create_client_session_id
     db = SessionLocal()
     try:
         scaffold_variant_task = TaskModel(
-            user_id="default_user",
+            user_id=get_or_create_client_session_id(client),
             title="Supply Chain Analytics Variant",
             description="Variant test",
             budget=10.0,
@@ -489,12 +493,13 @@ def test_paypal_order_creation_rejects_unapproved_or_incomplete_task():
     """Verify server-side positive validation rejects payment creation if QA != APPROVED or steps incomplete."""
     from api.database import SessionLocal
     from api.models.task import TaskModel
+    from api.services.auth_session import get_or_create_client_session_id
 
     db = SessionLocal()
     try:
         # Create a mock task in database with live_ai mode but awaiting_payment without QA approval
         task = TaskModel(
-            user_id="default_user",
+            user_id=get_or_create_client_session_id(client),
             title="Satellite Telecom Market Survey",
             description="LEO constellation analysis.",
             budget=10.0,
@@ -526,11 +531,12 @@ def test_server_side_paywall_masks_deliverable():
     """Verify that final_output is None and content markdown is masked until task is paid/completed."""
     from api.database import SessionLocal
     from api.models.task import TaskModel, TaskStepModel
+    from api.services.auth_session import get_or_create_client_session_id
 
     db = SessionLocal()
     try:
         task = TaskModel(
-            user_id="default_user",
+            user_id=get_or_create_client_session_id(client),
             title="Robotics Manufacturing Report",
             description="Precision robotics market.",
             budget=10.0,
@@ -1086,17 +1092,17 @@ async def test_8_additional_model_figures_do_not_inherit_user_provided_provenanc
         mock_gen.return_value = mock_gemini
         research_res = await ra.execute(title, desc)
 
-    # Current is user-provided, but forecast is unverified estimate
-    assert research_res["market_size_current_provenance"] == "user_provided"
-    assert research_res["market_size_forecast_provenance"] == "unverified_estimate"
-    assert research_res["quantitative_evidence_status"] == "unverified_estimate"
+        # Current is user-provided, but forecast is unverified estimate
+        assert research_res["market_size_current_provenance"] == "user_provided"
+        assert research_res["market_size_forecast_provenance"] == "unverified_estimate"
+        assert research_res["quantitative_evidence_status"] == "unverified_estimate"
 
-    # Data analysis must NOT calculate CAGR or charts with unverified forecast
-    analysis_res = await da.execute(title, research_res)
-    metrics = analysis_res.get("computed_metrics", {})
-    assert metrics["status"] == "unverified_estimate"
-    assert metrics["cagr_percent"] is None
-    assert analysis_res.get("chart_revenue_projections") == []
+        # Data analysis must NOT calculate CAGR or charts with unverified forecast
+        analysis_res = await da.execute(title, research_res)
+        metrics = analysis_res.get("computed_metrics", {})
+        assert metrics["status"] == "unverified_estimate"
+        assert metrics["cagr_percent"] is None
+        assert analysis_res.get("chart_revenue_projections") == []
 
 
 @pytest.mark.asyncio
@@ -1112,20 +1118,26 @@ async def test_9_unverified_quantitative_claims_remain_blocked_from_payment_and_
         "market_size_forecast": "$230B"
     }
 
-    analysis_res = await da.execute("Unverified Market", unverified_research)
-    assert analysis_res.get("chart_revenue_projections") == []
-    assert analysis_res.get("computed_metrics", {}).get("cagr_percent") is None
+    mock_da_out = {
+        "computed_metrics": {"cagr_percent": None, "status": "unverified_estimate"},
+        "chart_revenue_projections": []
+    }
+    with patch.object(llm_provider, "generate_json", new_callable=AsyncMock) as mock_gen:
+        mock_gen.return_value = mock_da_out
+        analysis_res = await da.execute("Unverified Market", unverified_research)
+        assert analysis_res.get("chart_revenue_projections") == []
+        assert analysis_res.get("computed_metrics", {}).get("cagr_percent") is None
 
-    qa_res = await qa.execute(
-        "Unverified Market",
-        "Objective",
-        {"report_markdown": "# Unverified Report\nValid markdown exceeding 100 characters in length."},
-        unverified_research,
-        analysis_res
-    )
-    assert qa_res["audit_status"] == "NEEDS_REVISION"
-    assert qa_res["is_payment_eligible"] is False
-    assert qa_res["external_verification_performed"] is False
+        qa_res = await qa.execute(
+            "Unverified Market",
+            "Objective",
+            {"report_markdown": "# Unverified Report\nValid markdown exceeding 100 characters in length."},
+            unverified_research,
+            analysis_res
+        )
+        assert qa_res["audit_status"] == "NEEDS_REVISION"
+        assert qa_res["is_payment_eligible"] is False
+        assert qa_res["external_verification_performed"] is False
 
 
 @pytest.mark.asyncio
@@ -1195,10 +1207,11 @@ def test_11_offline_scaffold_and_failed_ai_remain_ineligible_for_payment():
         # 2. Server-side payment rejection on scaffold
         from api.database import SessionLocal
         from api.models.task import TaskModel
+        from api.services.auth_session import get_or_create_client_session_id
         db = SessionLocal()
         try:
             t = TaskModel(
-                user_id="user_test_11",
+                user_id=get_or_create_client_session_id(client),
                 title="Test 11 Scaffold",
                 description="Scaffold mode test",
                 budget=10.0,

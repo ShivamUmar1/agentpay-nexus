@@ -138,7 +138,8 @@ export interface SystemStatus {
   environment: string;
   version: string;
   timestamp: string;
-  database: {
+  status?: string;
+  database?: {
     status: string;
     type: string;
     hosted?: string;
@@ -151,7 +152,7 @@ export interface SystemStatus {
     };
     error?: string;
   };
-  ai_orchestration: {
+  ai_orchestration?: {
     provider: string;
     status: string;
     model: string;
@@ -159,7 +160,7 @@ export interface SystemStatus {
     sample_response?: string;
     error?: string;
   };
-  payment_gateway: {
+  payment_gateway?: {
     status: string;
     mode: string;
     configured?: boolean;

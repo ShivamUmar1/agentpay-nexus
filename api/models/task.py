@@ -82,11 +82,11 @@ class AgentRunModel(Base):
 # Pydantic Schemas
 class TaskCreateRequest(BaseModel):
     title: str = Field(..., min_length=3, max_length=256)
-    description: str = Field(..., min_length=10)
-    budget: float = Field(..., gt=0)
-    currency: str = "USD"
-    constraints: Optional[str] = None
-    expected_deliverables: Optional[str] = None
+    description: str = Field(..., min_length=10, max_length=2000)
+    budget: float = Field(..., gt=0, le=1000.0)
+    currency: str = Field("USD", max_length=8)
+    constraints: Optional[str] = Field(None, max_length=1000)
+    expected_deliverables: Optional[str] = Field(None, max_length=1000)
 
 
 class StepResponse(BaseModel):

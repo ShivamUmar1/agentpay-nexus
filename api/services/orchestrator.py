@@ -2,6 +2,7 @@ import json
 import logging
 from datetime import datetime
 from typing import Dict, Any, Optional, List
+from fastapi import HTTPException, status
 from sqlalchemy.orm import Session
 
 from api.models.task import TaskModel, TaskStepModel, AgentRunModel
@@ -243,11 +244,27 @@ class OrchestrationEngine:
                 "message": "No eligible steps to advance."
             }
 
-        # Execute next_step
-        next_step.status = "running"
-        next_step.started_at = datetime.utcnow()
+        # Atomically claim and transition next_step from "pending" to "running"
+        now = datetime.utcnow()
+        rows_updated = db.query(TaskStepModel).filter(
+            TaskStepModel.id == next_step.id,
+            TaskStepModel.status == "pending"
+        ).update({
+            "status": "running",
+            "started_at": now
+        }, synchronize_session=False)
+
+        if rows_updated == 0:
+            db.rollback()
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=f"Workflow step '{next_step.step_name}' is currently executing. Parallel advancement is locked."
+            )
+
         task.current_step = next_step.step_name
         db.commit()
+        db.refresh(next_step)
+        db.refresh(task)
 
         try:
             if next_step.step_name == "research":

@@ -1,9 +1,6 @@
-import asyncio
 from datetime import datetime
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException, status
 from api.config import settings
-from api.database import test_db_connection
-from api.services.paypal_service import paypal_service
 from api.services.llm_provider import llm_provider
 
 router = APIRouter(prefix="/api", tags=["System"])
@@ -21,25 +18,28 @@ def health_check():
 
 
 @router.get("/system/status")
-async def system_status():
-    """Diagnostic endpoint reporting backend integration configurations without triggering external AI calls or timing out."""
-    db_status = test_db_connection()
-    ai_status = llm_provider.get_status()
-    payment_status = await paypal_service.test_connection()
-
+def system_status():
+    """Minimal public service health status without active database queries, external network calls, or credential leaks."""
+    env_label = "production" if settings.is_production else settings.APP_ENV
     return {
+        "status": "operational",
         "service": settings.APP_NAME,
-        "environment": settings.APP_ENV,
+        "environment": env_label,
         "version": "1.0.0",
-        "timestamp": datetime.utcnow().isoformat(),
-        "database": db_status,
-        "ai_orchestration": ai_status,
-        "payment_gateway": payment_status
+        "timestamp": datetime.utcnow().isoformat()
     }
 
 
 @router.get("/system/test-ai")
 @router.post("/system/test-ai")
 async def test_ai_connection():
-    """Bounded live diagnostic endpoint for testing active AI inference (max 3.0s timeout)."""
+    """Bounded live diagnostic endpoint for testing active AI inference.
+    Disabled in production by default. Only accessible in explicitly non-production environments
+    when explicitly enabled via ENABLE_LIVE_AI_DIAGNOSTICS configuration.
+    """
+    if settings.is_production or not settings.ENABLE_LIVE_AI_DIAGNOSTICS:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Live AI diagnostics are disabled in this environment."
+        )
     return await llm_provider.test_connection()

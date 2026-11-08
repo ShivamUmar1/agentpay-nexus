@@ -20,8 +20,10 @@ from api.models.payment import (
     TransactionResponse,
 )
 from api.models.log import ActivityLogModel, ActivityLogResponse
+from api.models.ratelimit import RateLimitRecord
 
 __all__ = [
+    "RateLimitRecord",
     "AgentModel",
     "AgentResponse",
     "AgentListResponse",

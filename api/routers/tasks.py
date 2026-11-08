@@ -1,23 +1,27 @@
 import json
-from typing import Optional, List
-from fastapi import APIRouter, Depends, HTTPException, Header
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from sqlalchemy.orm import Session
 
 from api.database import get_db
-from api.models.task import TaskModel, TaskStepModel, TaskCreateRequest, TaskResponse, TaskListResponse, StepResponse
+from api.models.task import (
+    TaskModel,
+    TaskStepModel,
+    TaskCreateRequest,
+    TaskResponse,
+    TaskListResponse,
+    StepResponse,
+)
 from api.services.orchestrator import orchestration_engine
 from api.services.llm_provider import AIError, AIErrorKind
+from api.services.auth_session import get_current_session, verify_task_ownership
+from api.services.rate_limiter import (
+    enforce_task_creation_guards,
+    enforce_step_advancement_guards,
+    release_active_inflight,
+)
 
 router = APIRouter(prefix="/api/tasks", tags=["Tasks"])
-
-
-def get_current_user_id(authorization: Optional[str] = Header(None)) -> str:
-    """Extracts user ID from Supabase JWT or defaults to guest/demo user."""
-    if authorization and authorization.startswith("Bearer "):
-        token = authorization.split(" ")[1]
-        # In full Supabase auth setup, verify JWT; for demo/hackathon fallback to sub or token prefix
-        return "user_auth_demo"
-    return "user_guest_01"
 
 
 def format_task_response(task: TaskModel) -> TaskResponse:
@@ -70,14 +74,22 @@ def format_task_response(task: TaskModel) -> TaskResponse:
 @router.post("", response_model=TaskResponse)
 async def create_task(
     payload: TaskCreateRequest,
+    request: Request,
+    response: Response,
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id)
+    session_id: str = Depends(get_current_session)
 ):
-    """Submits a new task objective and triggers multi-agent planning."""
+    """Submits a new task objective and triggers multi-agent planning.
+    Guarded by distributed session/IP rate limiting and active task concurrency caps.
+    """
+    # 1. Enforce rate limits and concurrency caps BEFORE AI planning
+    enforce_task_creation_guards(request=request, db=db, session_id=session_id)
+
+    # 2. Execute planning via multi-agent orchestrator with verified session identity
     try:
         task = await orchestration_engine.create_and_plan_task(
             db=db,
-            user_id=user_id,
+            user_id=session_id,
             title=payload.title,
             description=payload.description,
             budget=payload.budget,
@@ -94,6 +106,8 @@ async def create_task(
                 "message": ai_err.user_message
             }
         )
+    finally:
+        release_active_inflight(db=db, session_id=session_id)
 
 
 @router.get("", response_model=TaskListResponse)
@@ -101,10 +115,10 @@ def list_tasks(
     status: Optional[str] = None,
     limit: int = 50,
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id)
+    session_id: str = Depends(get_current_session)
 ):
-    """Lists tasks for the current authenticated user."""
-    query = db.query(TaskModel).filter(TaskModel.user_id == user_id)
+    """Lists tasks owned strictly by the current verified session identity."""
+    query = db.query(TaskModel).filter(TaskModel.user_id == session_id)
     if status:
         query = query.filter(TaskModel.status == status)
 
@@ -117,22 +131,76 @@ def list_tasks(
 def get_task(
     task_id: str,
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id)
+    session_id: str = Depends(get_current_session)
 ):
-    """Retrieves full details, execution plan, and subtask steps for a task."""
-    task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found.")
+    """Retrieves full details for a task. Requires verified ownership."""
+    task = verify_task_ownership(task_id=task_id, session_id=session_id, db=db)
     return format_task_response(task)
 
 
 @router.post("/{task_id}/advance")
 async def advance_task_step(
     task_id: str,
+    request: Request,
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id)
+    session_id: str = Depends(get_current_session)
 ):
-    """Advances the task by 1 bounded workflow step (Vercel serverless friendly)."""
+    """Advances the task by 1 bounded workflow step.
+    Enforces ownership, idempotent non-repetition of completed steps, parallel execution guards,
+    and distributed step execution rate limiting before AI agent invocation.
+    """
+    # 1. Ownership check: Unauthorized callers receive 404 before rate limits or task state are touched
+    task = verify_task_ownership(task_id=task_id, session_id=session_id, db=db)
+
+    # 2. State check: do not execute AI or consume quota if task is already completed or cancelled
+    if task.status in ["completed", "cancelled"]:
+        return {
+            "task_id": task.id,
+            "status": task.status,
+            "current_step": task.current_step,
+            "message": "Task workflow is already completed."
+        }
+
+    # 3. Concurrency guard: prevent duplicate parallel execution of steps
+    running_step = db.query(TaskStepModel).filter(
+        TaskStepModel.task_id == task.id,
+        TaskStepModel.status == "running"
+    ).first()
+    if running_step:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Workflow step '{running_step.step_name}' is currently executing. Parallel advancement is locked."
+        )
+
+    # 4. Check whether an eligible pending step exists before consuming step rate quota
+    steps = db.query(TaskStepModel).filter(TaskStepModel.task_id == task.id).all()
+    step_dict = {s.step_name: s for s in steps}
+    next_step: Optional[TaskStepModel] = None
+    for s in steps:
+        if s.status == "pending":
+            deps = json.loads(s.dependencies or "[]")
+            if all(step_dict.get(d) and step_dict[d].status == "completed" for d in deps):
+                next_step = s
+                break
+
+    if not next_step:
+        if step_dict.get("payment_approval") and step_dict["payment_approval"].status == "running":
+            return {
+                "task_id": task.id,
+                "status": "awaiting_payment",
+                "current_step": "payment_approval",
+                "message": "Task is awaiting explicit user payment authorization via PayPal Checkout."
+            }
+        return {
+            "task_id": task.id,
+            "status": task.status,
+            "current_step": task.current_step,
+            "message": "No eligible steps to advance."
+        }
+
+    # 5. Enforce AI step advancement rate limits BEFORE executing inference
+    enforce_step_advancement_guards(request=request, db=db, session_id=session_id)
+
     try:
         result = await orchestration_engine.advance_task(db=db, task_id=task_id)
         return result
@@ -153,12 +221,10 @@ async def advance_task_step(
 def cancel_task(
     task_id: str,
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id)
+    session_id: str = Depends(get_current_session)
 ):
-    """Cancels an in-progress or planned task."""
-    task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found.")
+    """Cancels an in-progress or planned task. Requires verified ownership."""
+    task = verify_task_ownership(task_id=task_id, session_id=session_id, db=db)
 
     if task.status in ["completed", "paid"]:
         raise HTTPException(status_code=400, detail="Cannot cancel a completed or paid task.")

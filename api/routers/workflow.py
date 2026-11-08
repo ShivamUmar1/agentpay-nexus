@@ -1,21 +1,24 @@
 import json
-from typing import List, Dict, Any
-from fastapi import APIRouter, Depends, HTTPException
+from typing import List
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from api.database import get_db
-from api.models.task import TaskModel, TaskStepModel
+from api.models.task import TaskStepModel
 from api.models.log import ActivityLogModel, ActivityLogResponse
+from api.services.auth_session import get_current_session, verify_task_ownership
 
 router = APIRouter(prefix="/api/tasks/{task_id}", tags=["Workflow"])
 
 
 @router.get("/progress")
-def get_task_progress(task_id: str, db: Session = Depends(get_db)):
-    """Retrieves execution progress and node dependencies for the visual workflow."""
-    task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found.")
+def get_task_progress(
+    task_id: str,
+    db: Session = Depends(get_db),
+    session_id: str = Depends(get_current_session)
+):
+    """Retrieves execution progress and node dependencies for the visual workflow. Requires verified ownership."""
+    task = verify_task_ownership(task_id=task_id, session_id=session_id, db=db)
 
     steps = db.query(TaskStepModel).filter(TaskStepModel.task_id == task_id).all()
     total_steps = len(steps)
@@ -48,8 +51,15 @@ def get_task_progress(task_id: str, db: Session = Depends(get_db)):
 
 
 @router.get("/activity", response_model=List[ActivityLogResponse])
-def get_task_activity(task_id: str, limit: int = 50, db: Session = Depends(get_db)):
-    """Retrieves real-time execution activity logs for this task."""
+def get_task_activity(
+    task_id: str,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    session_id: str = Depends(get_current_session)
+):
+    """Retrieves real-time execution activity logs for this task. Requires verified ownership."""
+    verify_task_ownership(task_id=task_id, session_id=session_id, db=db)
+
     logs = (
         db.query(ActivityLogModel)
         .filter(ActivityLogModel.task_id == task_id)
@@ -61,14 +71,16 @@ def get_task_activity(task_id: str, limit: int = 50, db: Session = Depends(get_d
 
 
 @router.get("/results")
-def get_task_results(task_id: str, db: Session = Depends(get_db)):
-    """Retrieves verified deliverables and final report if unlocked."""
-    task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found.")
+def get_task_results(
+    task_id: str,
+    db: Session = Depends(get_db),
+    session_id: str = Depends(get_current_session)
+):
+    """Retrieves verified deliverables and final report if unlocked. Requires verified ownership."""
+    task = verify_task_ownership(task_id=task_id, session_id=session_id, db=db)
 
     is_unlocked = task.status in ["completed", "paid"]
-    
+
     return {
         "task_id": task.id,
         "title": task.title,

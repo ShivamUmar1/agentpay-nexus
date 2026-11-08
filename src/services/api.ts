@@ -2,6 +2,13 @@ import { Agent, Task, PaymentSummary, Transaction, ActivityLog, SystemStatus } f
 
 const API_BASE = import.meta.env.VITE_API_BASE_URL || '';
 
+async function apiFetch(url: string, options: RequestInit = {}): Promise<Response> {
+  return fetch(url, {
+    ...options,
+    credentials: 'include',
+  });
+}
+
 async function handleResponse<T>(res: Response): Promise<T> {
   if (!res.ok) {
     let errorDetail = res.statusText;
@@ -30,23 +37,23 @@ export const api = {
     if (params?.search) query.append('search', params.search);
     if (params?.max_price) query.append('max_price', params.max_price.toString());
     if (params?.sort_by) query.append('sort_by', params.sort_by);
-    const res = await fetch(`${API_BASE}/api/agents?${query.toString()}`);
+    const res = await apiFetch(`${API_BASE}/api/agents?${query.toString()}`);
     return handleResponse(res);
   },
 
   async getAgent(id: string): Promise<Agent> {
-    const res = await fetch(`${API_BASE}/api/agents/${id}`);
+    const res = await apiFetch(`${API_BASE}/api/agents/${id}`);
     return handleResponse(res);
   },
 
   async getCategories(): Promise<string[]> {
-    const res = await fetch(`${API_BASE}/api/agents/categories`);
+    const res = await apiFetch(`${API_BASE}/api/agents/categories`);
     return handleResponse(res);
   },
 
   // Tasks
   async createTask(data: { title: string; description: string; budget: number; currency?: string; constraints?: string }): Promise<Task> {
-    const res = await fetch(`${API_BASE}/api/tasks`, {
+    const res = await apiFetch(`${API_BASE}/api/tasks`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(data),
@@ -55,24 +62,24 @@ export const api = {
   },
 
   async getTasks(): Promise<{ tasks: Task[]; total: number }> {
-    const res = await fetch(`${API_BASE}/api/tasks`);
+    const res = await apiFetch(`${API_BASE}/api/tasks`);
     return handleResponse(res);
   },
 
   async getTask(id: string): Promise<Task> {
-    const res = await fetch(`${API_BASE}/api/tasks/${id}`);
+    const res = await apiFetch(`${API_BASE}/api/tasks/${id}`);
     return handleResponse(res);
   },
 
   async advanceTask(id: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/api/tasks/${id}/advance`, {
+    const res = await apiFetch(`${API_BASE}/api/tasks/${id}/advance`, {
       method: 'POST',
     });
     return handleResponse(res);
   },
 
   async cancelTask(id: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/api/tasks/${id}/cancel`, {
+    const res = await apiFetch(`${API_BASE}/api/tasks/${id}/cancel`, {
       method: 'POST',
     });
     return handleResponse(res);
@@ -80,28 +87,28 @@ export const api = {
 
   // Workflow
   async getTaskProgress(taskId: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/api/tasks/${taskId}/progress`);
+    const res = await apiFetch(`${API_BASE}/api/tasks/${taskId}/progress`);
     return handleResponse(res);
   },
 
   async getTaskActivity(taskId: string): Promise<ActivityLog[]> {
-    const res = await fetch(`${API_BASE}/api/tasks/${taskId}/activity`);
+    const res = await apiFetch(`${API_BASE}/api/tasks/${taskId}/activity`);
     return handleResponse(res);
   },
 
   async getTaskResults(taskId: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/api/tasks/${taskId}/results`);
+    const res = await apiFetch(`${API_BASE}/api/tasks/${taskId}/results`);
     return handleResponse(res);
   },
 
   // Payments
   async getPaymentSummary(taskId: string): Promise<PaymentSummary> {
-    const res = await fetch(`${API_BASE}/api/payments/summary/${taskId}`);
+    const res = await apiFetch(`${API_BASE}/api/payments/summary/${taskId}`);
     return handleResponse(res);
   },
 
   async createPayPalOrder(taskId: string, returnUrl?: string, cancelUrl?: string): Promise<{ order_id: string; status: string; amount: number; currency: string; provider: string; approval_url?: string }> {
-    const res = await fetch(`${API_BASE}/api/payments/paypal/create-order`, {
+    const res = await apiFetch(`${API_BASE}/api/payments/paypal/create-order`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ 
@@ -114,12 +121,12 @@ export const api = {
   },
 
   async getPayPalOrderStatus(orderId: string): Promise<{ order_id: string; status: string; intent?: string; amount?: any; payee?: any }> {
-    const res = await fetch(`${API_BASE}/api/payments/paypal/order/${orderId}`);
+    const res = await apiFetch(`${API_BASE}/api/payments/paypal/order/${orderId}`);
     return handleResponse(res);
   },
 
   async capturePayPalOrder(taskId: string, orderId: string): Promise<{ success: boolean; transaction_id: string; capture_id?: string; order_id: string; status: string; amount: number; currency: string; provider: string; message: string }> {
-    const res = await fetch(`${API_BASE}/api/payments/paypal/capture-order`, {
+    const res = await apiFetch(`${API_BASE}/api/payments/paypal/capture-order`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ task_id: taskId, order_id: orderId }),
@@ -128,13 +135,13 @@ export const api = {
   },
 
   async getTransactions(): Promise<Transaction[]> {
-    const res = await fetch(`${API_BASE}/api/payments/transactions`);
+    const res = await apiFetch(`${API_BASE}/api/payments/transactions`);
     return handleResponse(res);
   },
 
   // System
   async getSystemStatus(): Promise<SystemStatus> {
-    const res = await fetch(`${API_BASE}/api/system/status`);
+    const res = await apiFetch(`${API_BASE}/api/system/status`);
     return handleResponse(res);
   },
 };

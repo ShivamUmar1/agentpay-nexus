@@ -18,6 +18,7 @@ from api.models.payment import (
 from api.services.paypal_service import paypal_service
 from api.services.agents.finance_agent import FinanceAgent
 from api.services.orchestrator import orchestration_engine, log_activity
+from api.services.auth_session import get_current_session, verify_task_ownership
 
 logger = logging.getLogger(__name__)
 finance_agent = FinanceAgent()
@@ -25,16 +26,14 @@ finance_agent = FinanceAgent()
 router = APIRouter(prefix="/api/payments", tags=["Payments"])
 
 
-def get_current_user_id(authorization: Optional[str] = Header(None)) -> str:
-    return "user_guest_01"
-
-
 @router.get("/summary/{task_id}", response_model=PaymentSummary)
-def get_payment_summary(task_id: str, db: Session = Depends(get_db)):
-    """Computes transparent invoice breakdown using trusted database records."""
-    task = db.query(TaskModel).filter(TaskModel.id == task_id).first()
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found.")
+def get_payment_summary(
+    task_id: str,
+    db: Session = Depends(get_db),
+    session_id: str = Depends(get_current_session)
+):
+    """Computes transparent invoice breakdown using trusted database records. Requires verified ownership."""
+    task = verify_task_ownership(task_id=task_id, session_id=session_id, db=db)
 
     assigned_agents = ["agent_research_01", "agent_analysis_02", "agent_content_03", "agent_qa_04"]
     invoice = finance_agent.calculate_invoice(
@@ -91,12 +90,10 @@ def validate_task_payment_eligibility(task: TaskModel, db: Session, action: str 
 async def create_paypal_order(
     payload: OrderCreateRequest,
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id)
+    session_id: str = Depends(get_current_session)
 ):
-    """Creates a PayPal order via Orders v2 API based on backend database calculations."""
-    task = db.query(TaskModel).filter(TaskModel.id == payload.task_id).first()
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found.")
+    """Creates a PayPal order via Orders v2 API based on backend database calculations. Requires verified ownership."""
+    task = verify_task_ownership(task_id=payload.task_id, session_id=session_id, db=db)
 
     # Positive server-side payment eligibility enforcement
     validate_task_payment_eligibility(task, db, action="create payment order")
@@ -165,7 +162,7 @@ async def create_paypal_order(
         existing_tx.provider = provider
     else:
         new_tx = TransactionModel(
-            user_id=user_id,
+            user_id=session_id,
             task_id=task.id,
             paypal_order_id=order_result["order_id"],
             amount=amount,
@@ -193,8 +190,16 @@ async def create_paypal_order(
 
 
 @router.get("/paypal/order/{order_id}")
-async def get_paypal_order_status(order_id: str, db: Session = Depends(get_db)):
-    """Retrieves live verification status of a PayPal order directly from PayPal Orders v2 API."""
+async def get_paypal_order_status(
+    order_id: str,
+    db: Session = Depends(get_db),
+    session_id: str = Depends(get_current_session)
+):
+    """Retrieves live verification status of a PayPal order directly from PayPal Orders v2 API. Requires verified ownership if tracked."""
+    tx = db.query(TransactionModel).filter(TransactionModel.paypal_order_id == order_id).first()
+    if tx and tx.user_id != session_id:
+        raise HTTPException(status_code=404, detail="Order not found.")
+
     try:
         order = await paypal_service.get_order(order_id)
         return {
@@ -212,17 +217,18 @@ async def get_paypal_order_status(order_id: str, db: Session = Depends(get_db)):
 async def capture_paypal_order(
     payload: OrderCaptureRequest,
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id)
+    session_id: str = Depends(get_current_session)
 ):
-    """Captures and verifies authorized PayPal payment, unlocks deliverables."""
-    task = db.query(TaskModel).filter(TaskModel.id == payload.task_id).first()
-    if not task:
-        raise HTTPException(status_code=404, detail="Task not found.")
+    """Captures and verifies authorized PayPal payment, unlocks deliverables. Requires verified ownership."""
+    task = verify_task_ownership(task_id=payload.task_id, session_id=session_id, db=db)
 
     tx = db.query(TransactionModel).filter(
         TransactionModel.task_id == task.id,
         TransactionModel.paypal_order_id == payload.order_id
     ).first()
+
+    if tx and tx.user_id != session_id:
+        raise HTTPException(status_code=404, detail="Transaction not found.")
 
     # 1. Prevent duplicate captures (Idempotency Guard preserves historical successful captures)
     if tx and tx.payment_status in ["completed", "simulated_completed"]:
@@ -298,7 +304,7 @@ async def capture_paypal_order(
         tx.amount = capture_res["amount"]
     else:
         tx = TransactionModel(
-            user_id=user_id,
+            user_id=session_id,
             task_id=task.id,
             paypal_order_id=payload.order_id,
             paypal_capture_id=capture_res["capture_id"],
@@ -348,12 +354,12 @@ async def capture_paypal_order(
 @router.get("/transactions", response_model=List[TransactionResponse])
 def list_transactions(
     db: Session = Depends(get_db),
-    user_id: str = Depends(get_current_user_id)
+    session_id: str = Depends(get_current_session)
 ):
-    """Lists past payment transactions for audit and accounting."""
+    """Lists past payment transactions for audit and accounting. Filtered strictly to current session."""
     txs = (
         db.query(TransactionModel)
-        .filter(TransactionModel.user_id == user_id)
+        .filter(TransactionModel.user_id == session_id)
         .order_by(TransactionModel.created_at.desc())
         .all()
     )
