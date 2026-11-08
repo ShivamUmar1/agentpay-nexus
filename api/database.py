@@ -6,6 +6,7 @@ from typing import Generator, Dict, Any
 from sqlalchemy import create_engine, event, text
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from sqlalchemy.exc import OperationalError, DatabaseError
+from sqlalchemy.pool import NullPool, QueuePool
 from api.config import settings
 
 logger = logging.getLogger(__name__)
@@ -24,6 +25,28 @@ else:
 # Fallback SQLite URL (for serverless /tmp or local fallback)
 fallback_sqlite_url = "sqlite:////tmp/agentpay.db" if (os.environ.get("VERCEL") or os.environ.get("AWS_LAMBDA_FUNCTION_NAME") or not os.access(".", os.W_OK)) else "sqlite:///./agentpay.db"
 
+
+def get_postgres_pool_kwargs(is_hosted: bool) -> Dict[str, Any]:
+    """Returns PostgreSQL connection pool configuration.
+    Hosted serverless environments use NullPool (ideal for Supabase Transaction Pooler).
+    Local development and concurrency tests preserve QueuePool (pool_size=5, max_overflow=10).
+    """
+    if is_hosted:
+        return {
+            "poolclass": NullPool,
+            "pool_pre_ping": True,
+            "pool_recycle": 300,
+        }
+    return {
+        "poolclass": QueuePool,
+        "pool_size": 5,
+        "max_overflow": 10,
+        "pool_recycle": 300,
+        "pool_timeout": 15,
+        "pool_pre_ping": True,
+    }
+
+
 # Configure Primary Engine
 primary_connect_args = {}
 primary_engine_kwargs: Dict[str, Any] = {
@@ -37,12 +60,7 @@ if db_url.startswith("sqlite"):
         db_url = "sqlite:////tmp/agentpay.db"
 else:
     primary_connect_args["prepare_threshold"] = None
-    primary_engine_kwargs.update({
-        "pool_size": 5,
-        "max_overflow": 10,
-        "pool_recycle": 300,
-        "pool_timeout": 15
-    })
+    primary_engine_kwargs.update(get_postgres_pool_kwargs(settings.is_hosted))
 
 engine = create_engine(
     db_url,

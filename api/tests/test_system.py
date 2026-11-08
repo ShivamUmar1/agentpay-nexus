@@ -231,3 +231,72 @@ def test_all_hosted_and_local_environment_lockout_combinations(env_name, app_env
 
         if expected_status == 403:
             assert mock_gemini.call_count == 0
+
+
+def test_postgres_pool_configuration_hosted_vs_local():
+    """Verify that hosted environments use NullPool without QueuePool-specific sizing,
+    while local development preserves QueuePool with pool_size=5, max_overflow=10.
+    """
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import NullPool, QueuePool
+    from api.database import get_postgres_pool_kwargs
+
+    # 1. Hosted environment (Vercel / Lambda)
+    hosted_kwargs = get_postgres_pool_kwargs(is_hosted=True)
+    assert hosted_kwargs["poolclass"] is NullPool
+    assert hosted_kwargs.get("pool_recycle") == 300
+    assert hosted_kwargs.get("pool_pre_ping") is True
+    assert "pool_size" not in hosted_kwargs
+    assert "max_overflow" not in hosted_kwargs
+    assert "pool_timeout" not in hosted_kwargs
+
+    hosted_engine = create_engine("postgresql+psycopg://user:pass@localhost:5432/db", **hosted_kwargs)
+    assert isinstance(hosted_engine.pool, NullPool)
+    assert not isinstance(hosted_engine.pool, QueuePool)
+    assert hosted_engine.pool._recycle == 300
+    assert hosted_engine.pool._pre_ping is True
+
+    # 2. Local development / concurrency test environment
+    local_kwargs = get_postgres_pool_kwargs(is_hosted=False)
+    assert local_kwargs["poolclass"] is QueuePool
+    assert local_kwargs["pool_size"] == 5
+    assert local_kwargs["max_overflow"] == 10
+    assert local_kwargs["pool_recycle"] == 300
+    assert local_kwargs["pool_timeout"] == 15
+    assert local_kwargs.get("pool_pre_ping") is True
+
+    local_engine = create_engine("postgresql+psycopg://user:pass@localhost:5432/db", **local_kwargs)
+    assert isinstance(local_engine.pool, QueuePool)
+    assert local_engine.pool.size() == 5
+    assert local_engine.pool._max_overflow == 10
+    assert local_engine.pool._recycle == 300
+    assert local_engine.pool._timeout == 15
+    assert local_engine.pool._pre_ping is True
+
+
+def test_settings_is_hosted_governs_postgres_pool_kwargs():
+    """Verify that setting VERCEL=1 or VERCEL_ENV triggers NullPool hosted pool settings."""
+    from sqlalchemy import create_engine
+    from sqlalchemy.pool import NullPool, QueuePool
+    from api.database import get_postgres_pool_kwargs
+
+    # Test under Vercel hosted environment
+    with patch.dict("os.environ", {"VERCEL": "1", "VERCEL_ENV": "production"}):
+        assert settings.is_hosted is True
+        pool_kwargs = get_postgres_pool_kwargs(settings.is_hosted)
+        assert pool_kwargs["poolclass"] is NullPool
+        assert "pool_size" not in pool_kwargs
+        assert "max_overflow" not in pool_kwargs
+        hosted_engine = create_engine("postgresql+psycopg://user:pass@localhost:5432/db", **pool_kwargs)
+        assert isinstance(hosted_engine.pool, NullPool)
+
+    # Test under local unhosted environment
+    with patch.dict("os.environ", {"VERCEL": "", "VERCEL_ENV": "", "AWS_LAMBDA_FUNCTION_NAME": ""}):
+        assert settings.is_hosted is False
+        pool_kwargs = get_postgres_pool_kwargs(settings.is_hosted)
+        assert pool_kwargs["poolclass"] is QueuePool
+        assert pool_kwargs["pool_size"] == 5
+        assert pool_kwargs["max_overflow"] == 10
+        local_engine = create_engine("postgresql+psycopg://user:pass@localhost:5432/db", **pool_kwargs)
+        assert isinstance(local_engine.pool, QueuePool)
+        assert local_engine.pool.size() == 5
