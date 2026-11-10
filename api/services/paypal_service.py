@@ -1,4 +1,5 @@
 import base64
+from decimal import Decimal, InvalidOperation
 import logging
 import time
 import uuid
@@ -225,6 +226,27 @@ class PayPalService:
             "Content-Type": "application/json"
         }
 
+        expected_curr_norm = (currency or "USD").strip().upper()
+
+        # Parse expected amount strictly as Decimal
+        try:
+            expected_dec = Decimal(str(expected_amount)).quantize(Decimal("0.01"))
+            if not expected_dec.is_finite() or expected_dec <= 0:
+                raise ValueError("Expected amount must be a positive finite number")
+        except (InvalidOperation, ValueError, TypeError):
+            logger.error(f"Invalid expected amount configuration for order {order_id}: {expected_amount}")
+            return {
+                "success": False,
+                "order_id": order_id,
+                "capture_id": None,
+                "status": "FAILED",
+                "amount": 0.0,
+                "currency": expected_curr_norm,
+                "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                "is_simulated": False,
+                "message": f"Payment verification failed: Invalid expected amount ({expected_amount})."
+            }
+
         async with httpx.AsyncClient(timeout=20.0) as client:
             res = await client.post(url, headers=headers)
             if res.status_code >= 400:
@@ -238,52 +260,243 @@ class PayPalService:
                     err_data.get("message") or
                     res.text
                 )
-                logger.error(f"PayPal capture failed ({res.status_code}): {details}")
+                logger.error(f"PayPal capture failed ({res.status_code}) for order {order_id}: {details}")
                 return {
                     "success": False,
                     "order_id": order_id,
                     "capture_id": None,
                     "status": "FAILED",
-                    "amount": expected_amount,
-                    "currency": currency,
+                    "amount": 0.0,
+                    "currency": expected_curr_norm,
                     "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
                     "is_simulated": False,
                     "message": f"PayPal capture rejected: {details}"
                 }
 
-            capture_data = res.json()
-            status = capture_data.get("status")
-
-            if status != "COMPLETED":
+            try:
+                capture_data = res.json()
+            except Exception:
+                logger.error(f"PayPal capture response for order {order_id} was not valid JSON.")
                 return {
                     "success": False,
                     "order_id": order_id,
                     "capture_id": None,
-                    "status": status,
-                    "amount": expected_amount,
-                    "currency": currency,
+                    "status": "FAILED",
+                    "amount": 0.0,
+                    "currency": expected_curr_norm,
                     "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
                     "is_simulated": False,
-                    "message": f"Payment capture status is {status}, expected COMPLETED"
+                    "message": "Payment verification failed: Invalid response format from PayPal."
+                }
+
+            order_status = capture_data.get("status")
+            if order_status != "COMPLETED":
+                logger.error(f"PayPal capture rejected for order {order_id}: status is '{order_status}', expected 'COMPLETED'.")
+                return {
+                    "success": False,
+                    "order_id": order_id,
+                    "capture_id": None,
+                    "status": order_status or "FAILED",
+                    "amount": 0.0,
+                    "currency": expected_curr_norm,
+                    "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                    "is_simulated": False,
+                    "message": f"Payment capture status is '{order_status}', expected 'COMPLETED'."
                 }
 
             # Retrieve purchase unit capture details
-            purchase_units = capture_data.get("purchase_units", [])
-            captures = purchase_units[0].get("payments", {}).get("captures", []) if purchase_units else []
-            capture_id = captures[0].get("id") if captures else None
-            captured_amount = float(captures[0]["amount"]["value"]) if captures else expected_amount
+            purchase_units = capture_data.get("purchase_units")
+            if not isinstance(purchase_units, list) or len(purchase_units) == 0:
+                logger.error(f"PayPal capture response for order {order_id} missing purchase units.")
+                return {
+                    "success": False,
+                    "order_id": order_id,
+                    "capture_id": None,
+                    "status": "FAILED",
+                    "amount": 0.0,
+                    "currency": expected_curr_norm,
+                    "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                    "is_simulated": False,
+                    "message": "Payment verification failed: Missing purchase units in capture response."
+                }
 
-            # Security verification: Check amount match
-            if abs(captured_amount - expected_amount) > 0.01:
-                logger.warning(f"Payment amount mismatch: captured {captured_amount} != expected {expected_amount}")
+            pu_first = purchase_units[0] if isinstance(purchase_units[0], dict) else {}
+            payments_obj = pu_first.get("payments")
+            if not isinstance(payments_obj, dict):
+                logger.error(f"PayPal capture response for order {order_id} missing payments object.")
+                return {
+                    "success": False,
+                    "order_id": order_id,
+                    "capture_id": None,
+                    "status": "FAILED",
+                    "amount": 0.0,
+                    "currency": expected_curr_norm,
+                    "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                    "is_simulated": False,
+                    "message": "Payment verification failed: Missing payments in capture response."
+                }
+
+            captures = payments_obj.get("captures")
+            if not isinstance(captures, list) or len(captures) == 0:
+                logger.error(f"PayPal capture response for order {order_id} missing captures array.")
+                return {
+                    "success": False,
+                    "order_id": order_id,
+                    "capture_id": None,
+                    "status": "FAILED",
+                    "amount": 0.0,
+                    "currency": expected_curr_norm,
+                    "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                    "is_simulated": False,
+                    "message": "Payment verification failed: Missing captures array in capture response."
+                }
+
+            capture_item = captures[0]
+            if not isinstance(capture_item, dict):
+                logger.error(f"PayPal capture response for order {order_id} has invalid capture item.")
+                return {
+                    "success": False,
+                    "order_id": order_id,
+                    "capture_id": None,
+                    "status": "FAILED",
+                    "amount": 0.0,
+                    "currency": expected_curr_norm,
+                    "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                    "is_simulated": False,
+                    "message": "Payment verification failed: Malformed capture record in capture response."
+                }
+
+            capture_id = capture_item.get("id")
+            if not capture_id or not isinstance(capture_id, str) or not capture_id.strip():
+                logger.error(f"PayPal capture response for order {order_id} missing valid capture ID.")
+                return {
+                    "success": False,
+                    "order_id": order_id,
+                    "capture_id": None,
+                    "status": "FAILED",
+                    "amount": 0.0,
+                    "currency": expected_curr_norm,
+                    "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                    "is_simulated": False,
+                    "message": "Payment verification failed: Missing or empty capture ID."
+                }
+
+            capture_record_status = capture_item.get("status")
+            if capture_record_status != "COMPLETED":
+                logger.error(f"PayPal capture item for order {order_id} has status '{capture_record_status}', expected 'COMPLETED'.")
+                return {
+                    "success": False,
+                    "order_id": order_id,
+                    "capture_id": capture_id.strip(),
+                    "status": capture_record_status or "FAILED",
+                    "amount": 0.0,
+                    "currency": expected_curr_norm,
+                    "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                    "is_simulated": False,
+                    "message": f"Payment verification failed: Capture record status is '{capture_record_status}', expected 'COMPLETED'."
+                }
+
+            amount_obj = capture_item.get("amount")
+            if not isinstance(amount_obj, dict):
+                logger.error(f"PayPal capture response for order {order_id} missing amount object.")
+                return {
+                    "success": False,
+                    "order_id": order_id,
+                    "capture_id": capture_id.strip(),
+                    "status": "FAILED",
+                    "amount": 0.0,
+                    "currency": expected_curr_norm,
+                    "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                    "is_simulated": False,
+                    "message": "Payment verification failed: Missing amount object in capture response."
+                }
+
+            # Currency validation
+            captured_currency_raw = amount_obj.get("currency_code")
+            if not captured_currency_raw or not isinstance(captured_currency_raw, str) or not captured_currency_raw.strip():
+                logger.error(f"PayPal capture response for order {order_id} missing currency code.")
+                return {
+                    "success": False,
+                    "order_id": order_id,
+                    "capture_id": capture_id.strip(),
+                    "status": "FAILED",
+                    "amount": 0.0,
+                    "currency": expected_curr_norm,
+                    "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                    "is_simulated": False,
+                    "message": "Payment verification failed: Missing currency code in capture response."
+                }
+
+            captured_currency = captured_currency_raw.strip().upper()
+            if captured_currency != expected_curr_norm:
+                logger.error(f"PayPal currency mismatch for order {order_id}: captured {captured_currency} != expected {expected_curr_norm}.")
+                return {
+                    "success": False,
+                    "order_id": order_id,
+                    "capture_id": capture_id.strip(),
+                    "status": "FAILED",
+                    "amount": 0.0,
+                    "currency": captured_currency,
+                    "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                    "is_simulated": False,
+                    "message": f"Payment currency mismatch: captured {captured_currency}, expected {expected_curr_norm}."
+                }
+
+            # Strict amount parsing & validation using Decimal
+            raw_val = amount_obj.get("value")
+            if raw_val is None:
+                logger.error(f"PayPal capture response for order {order_id} missing amount value.")
+                return {
+                    "success": False,
+                    "order_id": order_id,
+                    "capture_id": capture_id.strip(),
+                    "status": "FAILED",
+                    "amount": 0.0,
+                    "currency": captured_currency,
+                    "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                    "is_simulated": False,
+                    "message": "Payment verification failed: Missing amount value in capture response."
+                }
+
+            try:
+                captured_dec = Decimal(str(raw_val).strip()).quantize(Decimal("0.01"))
+                if not captured_dec.is_finite() or captured_dec <= 0:
+                    raise ValueError("Captured amount must be a positive finite number")
+            except (InvalidOperation, ValueError, TypeError):
+                logger.error(f"PayPal capture amount malformed or non-finite for order {order_id}: {raw_val}")
+                return {
+                    "success": False,
+                    "order_id": order_id,
+                    "capture_id": capture_id.strip(),
+                    "status": "FAILED",
+                    "amount": 0.0,
+                    "currency": captured_currency,
+                    "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                    "is_simulated": False,
+                    "message": "Payment verification failed: Malformed or non-finite captured amount."
+                }
+
+            if captured_dec != expected_dec:
+                logger.error(f"PayPal amount mismatch for order {order_id}: captured ${captured_dec} != expected ${expected_dec}.")
+                return {
+                    "success": False,
+                    "order_id": order_id,
+                    "capture_id": capture_id.strip(),
+                    "status": "FAILED",
+                    "amount": float(captured_dec),
+                    "currency": captured_currency,
+                    "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
+                    "is_simulated": False,
+                    "message": f"Payment amount mismatch: captured ${captured_dec:.2f}, expected ${expected_dec:.2f}."
+                }
 
             return {
                 "success": True,
                 "order_id": order_id,
-                "capture_id": capture_id,
+                "capture_id": capture_id.strip(),
                 "status": "COMPLETED",
-                "amount": captured_amount,
-                "currency": currency,
+                "amount": float(captured_dec),
+                "currency": captured_currency,
                 "provider": f"paypal_{settings.PAYPAL_MODE.lower()}",
                 "is_simulated": False,
                 "message": "PayPal payment captured and verified successfully."
