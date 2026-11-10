@@ -2,6 +2,7 @@ import asyncio
 from enum import Enum
 import json
 import logging
+import random
 import re
 import time
 from typing import Dict, Any, Optional, List
@@ -9,6 +10,8 @@ import httpx
 from api.config import settings
 
 logger = logging.getLogger(__name__)
+
+AI_CUMULATIVE_DEADLINE: float = 18.0
 
 
 class ProviderHealthState(str, Enum):
@@ -335,12 +338,30 @@ class LLMProvider:
 
         last_error: Optional[AIError] = None
         timeout_val = settings.AI_REQUEST_TIMEOUT
+        start_time = time.monotonic()
 
         async with httpx.AsyncClient() as client:
             for idx, model in enumerate(models_to_try):
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={key}"
+                elapsed = time.monotonic() - start_time
+                remaining = max(0.0, AI_CUMULATIVE_DEADLINE - elapsed)
+                if remaining <= 0.5:
+                    if last_error:
+                        raise last_error
+                    raise AIError(
+                        kind=AIErrorKind.TIMEOUT,
+                        message=f"Gemini cumulative deadline of {AI_CUMULATIVE_DEADLINE}s reached before attempting {model}.",
+                        user_message="AI provider request timed out. Please retry.",
+                        model=model
+                    )
+
+                req_timeout = min(timeout_val, remaining)
+
                 try:
-                    response = await client.post(url, json=payload, timeout=timeout_val)
+                    response = await asyncio.wait_for(
+                        client.post(url, json=payload, timeout=req_timeout),
+                        timeout=req_timeout
+                    )
                     if response.status_code == 200:
                         data = response.json()
                         candidates = data.get("candidates", [])
@@ -382,36 +403,148 @@ class LLMProvider:
 
                     # Transient RPM rate limit: if retry_after <= 2.0s and on primary model, wait and retry once
                     if err.kind == AIErrorKind.RATE_LIMIT_TRANSIENT and err.retry_after and err.retry_after <= 2.0 and idx == 0:
-                        logger.info(f"Transient rate limit on {model}; waiting {err.retry_after}s before retry...")
-                        await asyncio.sleep(err.retry_after)
-                        retry_resp = await client.post(url, json=payload, timeout=timeout_val)
-                        if retry_resp.status_code == 200:
-                            data = retry_resp.json()
-                            candidates = data.get("candidates", [])
-                            if candidates and "content" in candidates[0]:
-                                parts = candidates[0]["content"].get("parts", [])
-                                if parts and "text" in parts[0]:
-                                    self._health_state = ProviderHealthState.HEALTHY
-                                    return parts[0]["text"]
-                        err = classify_gemini_error(
-                            status_code=retry_resp.status_code,
-                            response_text=retry_resp.text,
-                            headers=dict(retry_resp.headers),
-                            model=model
-                        )
+                        elapsed_before_sleep = time.monotonic() - start_time
+                        rem_before_sleep = max(0.0, AI_CUMULATIVE_DEADLINE - elapsed_before_sleep)
+                        if rem_before_sleep > (err.retry_after + 0.5):
+                            logger.info(f"Transient rate limit on {model}; waiting {err.retry_after}s before retry (remaining budget: {rem_before_sleep:.1f}s)...")
+                            try:
+                                await asyncio.wait_for(
+                                    asyncio.sleep(err.retry_after),
+                                    timeout=rem_before_sleep
+                                )
+                            except (asyncio.TimeoutError, TimeoutError):
+                                logger.warning(f"Gemini cumulative deadline of {AI_CUMULATIVE_DEADLINE}s reached during RPM retry delay on {model}.")
+                                err = AIError(
+                                    kind=AIErrorKind.TIMEOUT,
+                                    message=f"Gemini cumulative deadline of {AI_CUMULATIVE_DEADLINE}s reached during RPM retry delay on {model}.",
+                                    user_message="AI provider request timed out. Please retry.",
+                                    model=model
+                                )
+                                self._health_state = ProviderHealthState.DEGRADED
+                                last_error = err
+                                continue
+                        else:
+                            logger.warning(f"Insufficient remaining time ({rem_before_sleep:.2f}s) for RPM retry on {model} within {AI_CUMULATIVE_DEADLINE}s deadline.")
+
+                        rem_after_sleep = max(0.0, AI_CUMULATIVE_DEADLINE - (time.monotonic() - start_time))
+                        if rem_after_sleep > 0.5:
+                            retry_timeout = min(timeout_val, rem_after_sleep)
+                            try:
+                                retry_resp = await asyncio.wait_for(
+                                    client.post(url, json=payload, timeout=retry_timeout),
+                                    timeout=retry_timeout
+                                )
+                                if retry_resp.status_code == 200:
+                                    data = retry_resp.json()
+                                    candidates = data.get("candidates", [])
+                                    if candidates and "content" in candidates[0]:
+                                        parts = candidates[0]["content"].get("parts", [])
+                                        if parts and "text" in parts[0]:
+                                            self._health_state = ProviderHealthState.HEALTHY
+                                            return parts[0]["text"]
+                                err = classify_gemini_error(
+                                    status_code=retry_resp.status_code,
+                                    response_text=retry_resp.text,
+                                    headers=dict(retry_resp.headers),
+                                    model=model
+                                )
+                            except (httpx.TimeoutException, asyncio.TimeoutError, TimeoutError):
+                                err = AIError(
+                                    kind=AIErrorKind.TIMEOUT,
+                                    message=f"Gemini model {model} retry timed out within deadline.",
+                                    user_message="AI provider request timed out. Please retry.",
+                                    model=model
+                                )
+                        else:
+                            logger.warning(f"Insufficient remaining time for RPM retry on {model} within {AI_CUMULATIVE_DEADLINE}s deadline.")
+
+                    # Transient 503 Service Unavailable: exactly 1 bounded retry with jitter and cumulative deadline
+                    elif err.kind == AIErrorKind.SERVICE_UNAVAILABLE and response.status_code == 503 and idx == 0:
+                        delay = min(err.retry_after or 1.5, 2.5)
+                        delay += random.uniform(0.1, 0.4)
+                        elapsed_before_sleep = time.monotonic() - start_time
+                        rem_before_sleep = max(0.0, AI_CUMULATIVE_DEADLINE - elapsed_before_sleep)
+
+                        if rem_before_sleep > (delay + 0.5):
+                            logger.info(f"Transient 503 on {model}; waiting {delay:.2f}s before bounded retry (remaining budget: {rem_before_sleep:.1f}s)...")
+                            try:
+                                await asyncio.wait_for(
+                                    asyncio.sleep(delay),
+                                    timeout=rem_before_sleep
+                                )
+                            except (asyncio.TimeoutError, TimeoutError):
+                                logger.warning(f"Gemini cumulative deadline of {AI_CUMULATIVE_DEADLINE}s reached during 503 retry delay on {model}.")
+                                self._health_state = ProviderHealthState.DEGRADED
+                                raise AIError(
+                                    kind=AIErrorKind.TIMEOUT,
+                                    message=f"Gemini cumulative deadline of {AI_CUMULATIVE_DEADLINE}s reached during 503 retry delay on {model}.",
+                                    user_message="AI provider request timed out. Please retry.",
+                                    model=model
+                                )
+
+                            rem_after_sleep = max(0.0, AI_CUMULATIVE_DEADLINE - (time.monotonic() - start_time))
+                            if rem_after_sleep > 0.5:
+                                retry_timeout = min(timeout_val, rem_after_sleep)
+                                try:
+                                    retry_resp = await asyncio.wait_for(
+                                        client.post(url, json=payload, timeout=retry_timeout),
+                                        timeout=retry_timeout
+                                    )
+                                    if retry_resp.status_code == 200:
+                                        data = retry_resp.json()
+                                        candidates = data.get("candidates", [])
+                                        if candidates and "content" in candidates[0]:
+                                            parts = candidates[0]["content"].get("parts", [])
+                                            if parts and "text" in parts[0]:
+                                                self._health_state = ProviderHealthState.HEALTHY
+                                                self._last_health_check_time = time.time()
+                                                return parts[0]["text"]
+                                        self._health_state = ProviderHealthState.DEGRADED
+                                        raise AIError(
+                                            kind=AIErrorKind.MALFORMED_RESPONSE,
+                                            message=f"Gemini model {model} returned unexpected structure on retry: {str(data)[:200]}",
+                                            user_message="AI provider returned an unparseable response structure.",
+                                            status_code=200,
+                                            model=model
+                                        )
+                                    err = classify_gemini_error(
+                                        status_code=retry_resp.status_code,
+                                        response_text=retry_resp.text,
+                                        headers=dict(retry_resp.headers),
+                                        model=model
+                                    )
+                                    self._health_state = ProviderHealthState.DEGRADED
+                                    raise err
+                                except (httpx.TimeoutException, asyncio.TimeoutError, TimeoutError):
+                                    logger.warning(f"Gemini model {model} retry timed out within deadline.")
+                                    self._health_state = ProviderHealthState.DEGRADED
+                                    raise AIError(
+                                        kind=AIErrorKind.TIMEOUT,
+                                        message=f"Gemini model {model} retry timed out within deadline.",
+                                        user_message="AI provider request timed out. Please retry.",
+                                        model=model
+                                    )
+                            else:
+                                logger.warning(f"Insufficient remaining time ({rem_after_sleep:.2f}s) after sleep for 503 retry on {model}; aborting retry.")
+                                self._health_state = ProviderHealthState.DEGRADED
+                                raise err
+                        else:
+                            logger.warning(f"Insufficient remaining time ({rem_before_sleep:.2f}s) for 503 retry delay {delay:.2f}s within {AI_CUMULATIVE_DEADLINE}s budget; aborting retry.")
+                            self._health_state = ProviderHealthState.DEGRADED
+                            raise err
 
                     self._health_state = ProviderHealthState.DEGRADED
                     logger.warning(f"Gemini model {model} failed with {err.kind.value}; checking fallback model...")
                     last_error = err
                     continue
 
-                except httpx.TimeoutException:
+                except (httpx.TimeoutException, asyncio.TimeoutError, TimeoutError):
                     self._health_state = ProviderHealthState.DEGRADED
                     self._last_health_check_time = time.time()
-                    logger.warning(f"Gemini model {model} timed out after {timeout_val}s.")
+                    logger.warning(f"Gemini model {model} timed out after {req_timeout:.1f}s.")
                     last_error = AIError(
                         kind=AIErrorKind.TIMEOUT,
-                        message=f"Gemini model {model} timed out after {timeout_val}s.",
+                        message=f"Gemini model {model} timed out after {req_timeout:.1f}s.",
                         user_message="AI provider request timed out. Please retry.",
                         model=model
                     )

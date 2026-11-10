@@ -17,14 +17,32 @@ from api.services.llm_provider import (
     AIError,
     AIErrorKind
 )
+from typing import Any, Dict, Optional
 from api.services.agents.research_agent import ResearchAgent
 from api.services.agents.data_analysis_agent import DataAnalysisAgent
 from api.services.agents.content_agent import ContentAgent
 from api.services.agents.qa_agent import QualityAssuranceAgent
 from api.database import get_db, SessionLocal
-from api.models.task import TaskModel, TaskStepModel
+from api.models.task import TaskModel, TaskStepModel, AgentRunModel
 
 client = TestClient(app)
+
+
+@pytest.fixture(autouse=True)
+def elevated_ai_test_rate_limits():
+    orig_ip = settings.RATE_LIMIT_IP_TASKS_PER_HOUR
+    orig_guest = settings.RATE_LIMIT_GUEST_TASKS_PER_HOUR
+    orig_ip_steps = settings.RATE_LIMIT_IP_STEPS_PER_HOUR
+    orig_guest_steps = settings.RATE_LIMIT_GUEST_STEPS_PER_HOUR
+    settings.RATE_LIMIT_IP_TASKS_PER_HOUR = 1000
+    settings.RATE_LIMIT_GUEST_TASKS_PER_HOUR = 1000
+    settings.RATE_LIMIT_IP_STEPS_PER_HOUR = 1000
+    settings.RATE_LIMIT_GUEST_STEPS_PER_HOUR = 1000
+    yield
+    settings.RATE_LIMIT_IP_TASKS_PER_HOUR = orig_ip
+    settings.RATE_LIMIT_GUEST_TASKS_PER_HOUR = orig_guest
+    settings.RATE_LIMIT_IP_STEPS_PER_HOUR = orig_ip_steps
+    settings.RATE_LIMIT_GUEST_STEPS_PER_HOUR = orig_guest_steps
 
 
 # ==============================================================================
@@ -2017,3 +2035,858 @@ async def test_legitimate_user_provided_competitor_share_authorized():
 
     assert qa_res["audit_status"] == "APPROVED"
     assert qa_res["is_payment_eligible"] is True
+
+
+# ==============================================================================
+# SECTION 8.16 — BOUNDED GEMINI HTTP 503 RETRY & RESILIENCE REGRESSION TESTS
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_503_retry_succeeds_on_second_attempt():
+    """Verify that a single transient 503 triggers one bounded retry and returns success."""
+    resp_503 = MagicMock(spec=httpx.Response)
+    resp_503.status_code = 503
+    resp_503.text = json.dumps({
+        "error": {
+            "code": 503,
+            "message": "The model is overloaded. Please try again later.",
+            "status": "UNAVAILABLE"
+        }
+    })
+    resp_503.headers = {}
+
+    resp_200 = MagicMock(spec=httpx.Response)
+    resp_200.status_code = 200
+    resp_200.json.return_value = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {"text": "{\"status\": \"recovered_after_503\"}"}
+                    ]
+                }
+            }
+        ]
+    }
+
+    call_urls = []
+
+    async def fake_post(url, *args, **kwargs):
+        call_urls.append(url)
+        if len(call_urls) == 1:
+            return resp_503
+        return resp_200
+
+    sleep_calls = []
+
+    async def fake_sleep(duration):
+        sleep_calls.append(duration)
+
+    with patch.object(settings, "GEMINI_API_KEY", "mock-test-key-503-retry"):
+        with patch("httpx.AsyncClient.post", side_effect=fake_post):
+            with patch("asyncio.sleep", side_effect=fake_sleep):
+                res = await llm_provider.generate_json("Prompt triggering 503 retry", None)
+
+    assert res == {"status": "recovered_after_503"}
+    assert len(call_urls) == 2
+    assert call_urls[0] == call_urls[1]
+    assert len(sleep_calls) == 1
+    # Base delay (2.0s from 503 classifier) + jitter 0.1..0.4s
+    assert 1.5 <= sleep_calls[0] <= 2.8
+
+
+@pytest.mark.asyncio
+async def test_503_two_consecutive_503_raises_service_unavailable():
+    """Verify that two consecutive 503 responses abort after 1 retry and raise SERVICE_UNAVAILABLE without cascading."""
+    resp_503_1 = MagicMock(spec=httpx.Response)
+    resp_503_1.status_code = 503
+    resp_503_1.text = json.dumps({
+        "error": {
+            "code": 503,
+            "message": "The model is overloaded. Please try again later.",
+            "status": "UNAVAILABLE"
+        }
+    })
+    resp_503_1.headers = {}
+
+    resp_503_2 = MagicMock(spec=httpx.Response)
+    resp_503_2.status_code = 503
+    resp_503_2.text = json.dumps({
+        "error": {
+            "code": 503,
+            "message": "The model is overloaded. Please try again later.",
+            "status": "UNAVAILABLE"
+        }
+    })
+    resp_503_2.headers = {}
+
+    call_count = 0
+
+    async def fake_post(url, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return resp_503_1
+        return resp_503_2
+
+    sleep_calls = []
+
+    async def fake_sleep(duration):
+        sleep_calls.append(duration)
+
+    with patch.object(settings, "GEMINI_API_KEY", "mock-test-key-503-consecutive"):
+        with patch("httpx.AsyncClient.post", side_effect=fake_post):
+            with patch("asyncio.sleep", side_effect=fake_sleep):
+                with pytest.raises(AIError) as exc_info:
+                    await llm_provider.generate_json("Prompt triggering double 503", None)
+
+    assert exc_info.value.kind == AIErrorKind.SERVICE_UNAVAILABLE
+    assert exc_info.value.status_code == 503
+    assert call_count == 2
+    assert len(sleep_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_401_auth_error_no_retry():
+    """Verify that HTTP 401 raises AUTH_ERROR immediately without retry or sleep."""
+    resp_401 = MagicMock(spec=httpx.Response)
+    resp_401.status_code = 401
+    resp_401.text = json.dumps({
+        "error": {
+            "code": 401,
+            "message": "API key not valid. Please pass a valid API key.",
+            "status": "UNAUTHENTICATED"
+        }
+    })
+    resp_401.headers = {}
+
+    call_count = 0
+
+    async def fake_post(url, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return resp_401
+
+    with patch.object(settings, "GEMINI_API_KEY", "invalid-key-401"):
+        with patch("httpx.AsyncClient.post", side_effect=fake_post):
+            with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+                with pytest.raises(AIError) as exc_info:
+                    await llm_provider.generate_json("Prompt with 401", None)
+
+    assert exc_info.value.kind == AIErrorKind.AUTH_ERROR
+    assert call_count == 1
+    mock_sleep.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_403_auth_error_no_retry():
+    """Verify that HTTP 403 raises AUTH_ERROR immediately without retry or sleep."""
+    resp_403 = MagicMock(spec=httpx.Response)
+    resp_403.status_code = 403
+    resp_403.text = json.dumps({
+        "error": {
+            "code": 403,
+            "message": "The caller does not have permission",
+            "status": "PERMISSION_DENIED"
+        }
+    })
+    resp_403.headers = {}
+
+    call_count = 0
+
+    async def fake_post(url, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return resp_403
+
+    with patch.object(settings, "GEMINI_API_KEY", "forbidden-key-403"):
+        with patch("httpx.AsyncClient.post", side_effect=fake_post):
+            with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+                with pytest.raises(AIError) as exc_info:
+                    await llm_provider.generate_json("Prompt with 403", None)
+
+    assert exc_info.value.kind == AIErrorKind.AUTH_ERROR
+    assert call_count == 1
+    mock_sleep.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_404_model_not_found_no_retry():
+    """Verify that HTTP 404 raises MODEL_NOT_FOUND immediately without retry or sleep."""
+    resp_404 = MagicMock(spec=httpx.Response)
+    resp_404.status_code = 404
+    resp_404.text = json.dumps({
+        "error": {
+            "code": 404,
+            "message": "models/unknown-model is not found for API version v1beta",
+            "status": "NOT_FOUND"
+        }
+    })
+    resp_404.headers = {}
+
+    call_count = 0
+
+    async def fake_post(url, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return resp_404
+
+    with patch.object(settings, "GEMINI_API_KEY", "mock-key-404"):
+        with patch("httpx.AsyncClient.post", side_effect=fake_post):
+            with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+                with pytest.raises(AIError) as exc_info:
+                    await llm_provider.generate_json("Prompt with 404", None)
+
+    assert exc_info.value.kind == AIErrorKind.MODEL_NOT_FOUND
+    assert call_count == 1
+    mock_sleep.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_429_quota_exhausted_no_retry():
+    """Verify that HTTP 429 Daily Quota Exhaustion raises QUOTA_EXHAUSTED immediately without retry."""
+    resp_429 = MagicMock(spec=httpx.Response)
+    resp_429.status_code = 429
+    resp_429.text = json.dumps({
+        "error": {
+            "code": 429,
+            "message": "Resource has been exhausted (e.g. check quota). Queries per day exceeded.",
+            "status": "RESOURCE_EXHAUSTED"
+        }
+    })
+    resp_429.headers = {}
+
+    call_count = 0
+
+    async def fake_post(url, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return resp_429
+
+    with patch.object(settings, "GEMINI_API_KEY", "mock-key-quota-429"):
+        with patch("httpx.AsyncClient.post", side_effect=fake_post):
+            with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+                with pytest.raises(AIError) as exc_info:
+                    await llm_provider.generate_json("Prompt with 429 quota exhaustion", None)
+
+    assert exc_info.value.kind == AIErrorKind.QUOTA_EXHAUSTED
+    assert call_count == 1
+    mock_sleep.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_existing_transient_429_retry_policy_preserved():
+    """Verify that existing transient 429 RPM retry logic remains intact and functions as before."""
+    resp_429 = MagicMock(spec=httpx.Response)
+    resp_429.status_code = 429
+    resp_429.text = json.dumps({
+        "error": {
+            "code": 429,
+            "message": "Rate limit exceeded. Please retry after 1.0s.",
+            "status": "RESOURCE_EXHAUSTED"
+        }
+    })
+    resp_429.headers = {"retry-after": "1"}
+
+    resp_200 = MagicMock(spec=httpx.Response)
+    resp_200.status_code = 200
+    resp_200.json.return_value = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {"text": "{\"status\": \"rpm_recovered\"}"}
+                    ]
+                }
+            }
+        ]
+    }
+
+    call_count = 0
+
+    async def fake_post(url, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            return resp_429
+        return resp_200
+
+    sleep_calls = []
+
+    async def fake_sleep(duration):
+        sleep_calls.append(duration)
+
+    with patch.object(settings, "GEMINI_API_KEY", "mock-key-429-transient"):
+        with patch("httpx.AsyncClient.post", side_effect=fake_post):
+            with patch("asyncio.sleep", side_effect=fake_sleep):
+                res = await llm_provider.generate_json("Prompt with 429 transient", None)
+
+    assert res == {"status": "rpm_recovered"}
+    assert call_count == 2
+    assert len(sleep_calls) == 1
+    assert sleep_calls[0] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_503_retry_aborted_when_insufficient_time_remaining():
+    """Verify that if the first 503 attempt consumes nearly the full deadline budget, retry is aborted."""
+    resp_503 = MagicMock(spec=httpx.Response)
+    resp_503.status_code = 503
+    resp_503.text = json.dumps({
+        "error": {
+            "code": 503,
+            "message": "The model is overloaded. Please try again later.",
+            "status": "UNAVAILABLE"
+        }
+    })
+    resp_503.headers = {}
+
+    current_time = [0.0]
+
+    def fake_monotonic():
+        return current_time[0]
+
+    call_count = 0
+
+    async def fake_post(url, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        # Advance monotonic clock by 17.2s during the first request
+        current_time[0] += 17.2
+        return resp_503
+
+    with patch.object(settings, "GEMINI_API_KEY", "mock-key-budget-abort"):
+        with patch("time.monotonic", side_effect=fake_monotonic):
+            with patch("httpx.AsyncClient.post", side_effect=fake_post):
+                with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+                    with pytest.raises(AIError) as exc_info:
+                        await llm_provider.generate_json("Prompt with tight deadline", None)
+
+    assert exc_info.value.kind == AIErrorKind.SERVICE_UNAVAILABLE
+    # Retry was skipped because 18.0 - 17.2 = 0.8s, which is <= delay + 0.5s (~2.1s)
+    assert call_count == 1
+    mock_sleep.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_cumulative_deadline_enforces_budget_and_timeout():
+    """Verify that monotonic clock progression caps the second attempt's timeout to the remaining deadline."""
+    resp_503 = MagicMock(spec=httpx.Response)
+    resp_503.status_code = 503
+    resp_503.text = json.dumps({
+        "error": {
+            "code": 503,
+            "message": "The model is overloaded. Please try again later.",
+            "status": "UNAVAILABLE"
+        }
+    })
+    resp_503.headers = {}
+
+    resp_200 = MagicMock(spec=httpx.Response)
+    resp_200.status_code = 200
+    resp_200.json.return_value = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {"text": "{\"status\": \"deadline_budget_passed\"}"}
+                    ]
+                }
+            }
+        ]
+    }
+
+    current_time = [0.0]
+
+    def fake_monotonic():
+        return current_time[0]
+
+    captured_timeouts = []
+
+    async def fake_post(url, *args, **kwargs):
+        captured_timeouts.append(kwargs.get("timeout"))
+        if len(captured_timeouts) == 1:
+            current_time[0] += 6.0  # Call 1 took 6 seconds
+            return resp_503
+        return resp_200
+
+    async def fake_sleep(duration):
+        current_time[0] += 2.0  # Sleep took 2 seconds
+
+    with patch.object(settings, "GEMINI_API_KEY", "mock-key-budget-calc"):
+        with patch.object(settings, "AI_REQUEST_TIMEOUT", 12.0):
+            with patch("time.monotonic", side_effect=fake_monotonic):
+                with patch("httpx.AsyncClient.post", side_effect=fake_post):
+                    with patch("asyncio.sleep", side_effect=fake_sleep):
+                        res = await llm_provider.generate_json("Prompt for deadline calculation", None)
+
+    assert res == {"status": "deadline_budget_passed"}
+    # Call 1 had 18.0s remaining -> min(12.0, 18.0) = 12.0
+    # After Call 1 (6.0s) + Sleep (2.0s) = 8.0s elapsed -> remaining = 10.0s -> min(12.0, 10.0) = 10.0
+    assert captured_timeouts == [12.0, 10.0]
+
+
+def test_successful_internal_503_retry_prevents_duplicate_agent_runs():
+    """Verify that a 503 on first attempt followed by 200 on internal retry does NOT duplicate agent runs or steps."""
+    resp_503 = MagicMock(spec=httpx.Response)
+    resp_503.status_code = 503
+    resp_503.text = json.dumps({
+        "error": {
+            "code": 503,
+            "message": "The model is overloaded. Please try again later.",
+            "status": "UNAVAILABLE"
+        }
+    })
+    resp_503.headers = {}
+
+    resp_200 = MagicMock(spec=httpx.Response)
+    resp_200.status_code = 200
+    resp_200.json.return_value = {
+        "candidates": [
+            {
+                "content": {
+                    "parts": [
+                        {
+                            "text": json.dumps({
+                                "market_overview": "Autonomous logistics overview after 503 retry.",
+                                "market_size_current": "$35 Billion",
+                                "market_size_projected": "$95 Billion",
+                                "cagr": "18.2%",
+                                "key_drivers": ["Fleet electrification", "Autonomous navigation"],
+                                "challenges": ["Regulatory standards", "Sensor capital expenditure"],
+                                "market_share_breakdown": [{"label": "Provider Alpha", "value": 55.0, "category": "Logistics"}],
+                                "projections": [{"year": 2025, "value": 35.0}, {"year": 2030, "value": 95.0}]
+                            })
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+
+    # 1. Create a task in offline mode
+    with patch.object(settings, "GEMINI_API_KEY", None), patch.object(settings, "OPENAI_API_KEY", None):
+        res = client.post("/api/tasks", json={
+            "title": "Autonomous Drone Logistics Market Horizons",
+            "description": "Assess commercial drone delivery ecosystems.",
+            "budget": 15.0,
+            "currency": "USD"
+        })
+        assert res.status_code == 200
+        task_id = res.json()["id"]
+
+    # 2. Advance the research step with simulated 503 then 200
+    with patch.object(settings, "GEMINI_API_KEY", "mock-active-key-503-retry"):
+        with patch("httpx.AsyncClient.post", side_effect=[resp_503, resp_200]):
+            with patch("asyncio.sleep", new_callable=AsyncMock):
+                adv_res = client.post(f"/api/tasks/{task_id}/advance")
+
+    assert adv_res.status_code == 200
+    adv_data = adv_res.json()
+    assert adv_data["status"] == "executing"
+    assert adv_data["advanced_step"] == "research"
+
+    # 3. Verify exactly ONE AgentRunModel and ONE completed step exists in DB
+    db = SessionLocal()
+    try:
+        runs = db.query(AgentRunModel).filter(AgentRunModel.task_id == task_id).all()
+        assert len(runs) == 1
+        assert runs[0].agent_id == "agent_research_01"
+        assert runs[0].status == "completed"
+
+        steps = db.query(TaskStepModel).filter(
+            TaskStepModel.task_id == task_id,
+            TaskStepModel.step_name == "research"
+        ).all()
+        assert len(steps) == 1
+        assert steps[0].status == "completed"
+    finally:
+        db.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_request_cancelled_when_cumulative_deadline_expires_on_retry():
+    """Verify that an HTTP request remaining pending beyond the remaining deadline is cancelled and does not retry.
+
+    Validates:
+    - Initial request returns 503.
+    - Backoff delay executes and is included in the cumulative deadline.
+    - Second request remains pending.
+    - Hard asynchronous deadline cancels the pending request coroutine.
+    - No further retry is attempted after deadline exhaustion.
+    - Caller receives one structured AIError with AIErrorKind.TIMEOUT.
+    """
+    resp_503 = MagicMock(spec=httpx.Response)
+    resp_503.status_code = 503
+    resp_503.text = json.dumps({
+        "error": {
+            "code": 503,
+            "message": "The model is overloaded. Please try again later.",
+            "status": "UNAVAILABLE"
+        }
+    })
+    resp_503.headers = {"retry-after": "0.05"}
+
+    call_count = 0
+    request2_cancelled = False
+
+    async def fake_post(url, *args, **kwargs):
+        nonlocal call_count, request2_cancelled
+        call_count += 1
+        if call_count == 1:
+            await asyncio.sleep(0.05)
+            return resp_503
+        # Attempt 2: simulates an HTTP request that hangs indefinitely beyond remaining deadline
+        try:
+            await asyncio.sleep(10.0)
+        except asyncio.CancelledError:
+            request2_cancelled = True
+            raise
+
+    start_mono = time.monotonic()
+    with patch.object(settings, "GEMINI_API_KEY", "mock-test-key-retry-deadline-cancel"):
+        with patch.object(settings, "AI_REQUEST_TIMEOUT", 12.0):
+            with patch("random.uniform", return_value=0.02):
+                with patch("api.services.llm_provider.AI_CUMULATIVE_DEADLINE", 1.5):
+                    with patch("httpx.AsyncClient.post", side_effect=fake_post):
+                        with pytest.raises(AIError) as exc_info:
+                            await llm_provider.generate_json("Prompt for retry deadline cancellation", None)
+
+    elapsed_total = time.monotonic() - start_mono
+
+    # 1. Classified error is TIMEOUT
+    assert exc_info.value.kind == AIErrorKind.TIMEOUT
+    # 2. Hard async deadline cancelled the in-flight request
+    assert request2_cancelled is True
+    # 3. Exactly 2 calls made (attempt 1 was 503, attempt 2 timed out; NO third attempt)
+    assert call_count == 2
+    # 4. Total elapsed was strictly bounded by cumulative deadline (~1.5s), not hanging 10.0s
+    assert elapsed_total < 3.0
+
+
+@pytest.mark.asyncio
+async def test_pending_initial_request_cancelled_by_hard_deadline():
+    """Verify that an initial HTTP request hanging beyond timeout is hard-cancelled and halts immediately."""
+    request1_cancelled = False
+    call_count = 0
+
+    async def fake_post(url, *args, **kwargs):
+        nonlocal request1_cancelled, call_count
+        call_count += 1
+        try:
+            await asyncio.sleep(10.0)  # hangs indefinitely
+        except asyncio.CancelledError:
+            request1_cancelled = True
+            raise
+
+    start_mono = time.monotonic()
+    with patch.object(settings, "GEMINI_API_KEY", "mock-test-key-initial-deadline-cancel"):
+        with patch.object(settings, "AI_REQUEST_TIMEOUT", 0.2):
+            with patch("api.services.llm_provider.AI_CUMULATIVE_DEADLINE", 5.0):
+                with patch("httpx.AsyncClient.post", side_effect=fake_post):
+                    with pytest.raises(AIError) as exc_info:
+                        await llm_provider.generate_json("Prompt with hanging initial request", None)
+
+    elapsed_total = time.monotonic() - start_mono
+
+    assert exc_info.value.kind == AIErrorKind.TIMEOUT
+    assert request1_cancelled is True
+    assert call_count == 1
+    assert elapsed_total < 1.0
+
+
+@pytest.mark.asyncio
+async def test_503_retry_backoff_sleep_cancelled_when_deadline_expires():
+    """Verify that backoff sleep is hard-cancelled when remaining deadline expires, sending zero second requests."""
+    resp_503 = MagicMock(spec=httpx.Response)
+    resp_503.status_code = 503
+    resp_503.text = json.dumps({
+        "error": {
+            "code": 503,
+            "message": "The model is overloaded. Please try again later.",
+            "status": "UNAVAILABLE"
+        }
+    })
+    resp_503.headers = {"retry-after": "0.05"}
+
+    call_count = 0
+    sleep_started = False
+    sleep_cancelled = False
+
+    async def fake_post(url, *args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return resp_503
+
+    orig_sleep = asyncio.sleep
+
+    async def fake_sleep(duration):
+        nonlocal sleep_started, sleep_cancelled
+        sleep_started = True
+        try:
+            # Simulate a backoff sleep that hangs indefinitely beyond remaining deadline
+            await orig_sleep(10.0)
+        except asyncio.CancelledError:
+            sleep_cancelled = True
+            raise
+
+    start_mono = time.monotonic()
+    with patch.object(settings, "GEMINI_API_KEY", "mock-test-key-sleep-cancel"):
+        with patch.object(settings, "AI_REQUEST_TIMEOUT", 12.0):
+            with patch("random.uniform", return_value=0.02):
+                with patch("api.services.llm_provider.AI_CUMULATIVE_DEADLINE", 2.5):
+                    with patch("httpx.AsyncClient.post", side_effect=fake_post):
+                        with patch("asyncio.sleep", side_effect=fake_sleep):
+                            with pytest.raises(AIError) as exc_info:
+                                await llm_provider.generate_json("Prompt for sleep cancellation", None)
+
+    elapsed_total = time.monotonic() - start_mono
+
+    # 1. Backoff sleep was started and then hard-cancelled by asyncio.wait_for
+    assert sleep_started is True
+    assert sleep_cancelled is True
+    # 2. No second request was sent
+    assert call_count == 1
+    # 3. Caller receives one structured AIError with TIMEOUT classification
+    assert exc_info.value.kind == AIErrorKind.TIMEOUT
+    # 4. Total elapsed was strictly bounded by cumulative deadline (~2.5s), not hanging 10.0s
+    assert elapsed_total < 3.5
+
+
+# ==============================================================================
+# SECTION 8.5 — STRICT TWO-ATTEMPT MAXIMUM FOR 503 (TERMINAL RETRY PATH)
+# ==============================================================================
+
+@pytest.mark.asyncio
+async def test_503_followed_by_503_terminates_at_two_calls_without_fallback():
+    """Verify that primary 503 followed by retry 503 produces exactly 2 HTTP calls total, never invoking fallback."""
+    resp_503 = MagicMock(spec=httpx.Response)
+    resp_503.status_code = 503
+    resp_503.text = json.dumps({
+        "error": {
+            "code": 503,
+            "message": "The model is overloaded. Please try again later.",
+            "status": "UNAVAILABLE"
+        }
+    })
+    resp_503.headers = {"retry-after": "0.01"}
+
+    call_count = 0
+    called_urls = []
+
+    async def fake_post(url, *args, **kwargs):
+        nonlocal call_count, called_urls
+        call_count += 1
+        called_urls.append(url)
+        return resp_503
+
+    with patch.object(settings, "GEMINI_MODEL", "gemini-primary-test"):
+        with patch.object(settings, "GEMINI_FALLBACK_MODEL", "gemini-fallback-test"):
+            with patch.object(settings, "GEMINI_API_KEY", "mock-test-key-503-strict"):
+                with patch("random.uniform", return_value=0.01):
+                    with patch("httpx.AsyncClient.post", side_effect=fake_post):
+                        with pytest.raises(AIError) as exc_info:
+                            await llm_provider.generate_json("Prompt for 503 two-attempt max", None)
+
+    # 1. Classified error is SERVICE_UNAVAILABLE
+    assert exc_info.value.kind == AIErrorKind.SERVICE_UNAVAILABLE
+    assert exc_info.value.status_code == 503
+    # 2. Exactly 2 calls made (attempt 1 and retry 1 on primary)
+    assert call_count == 2
+    # 3. Both calls targeted primary model, fallback was never invoked
+    assert all("gemini-primary-test" in url for url in called_urls)
+    assert not any("gemini-fallback-test" in url for url in called_urls)
+
+
+@pytest.mark.asyncio
+async def test_503_followed_by_hanging_retry_terminates_at_two_calls_with_budget_remaining():
+    """Verify that primary 503 followed by a hanging retry terminates after 2 HTTP calls even if cumulative budget remains."""
+    resp_503 = MagicMock(spec=httpx.Response)
+    resp_503.status_code = 503
+    resp_503.text = json.dumps({
+        "error": {
+            "code": 503,
+            "message": "Model overloaded.",
+            "status": "UNAVAILABLE"
+        }
+    })
+    resp_503.headers = {"retry-after": "0.01"}
+
+    call_count = 0
+    called_urls = []
+    retry_cancelled = False
+
+    async def fake_post(url, *args, **kwargs):
+        nonlocal call_count, called_urls, retry_cancelled
+        call_count += 1
+        called_urls.append(url)
+        if call_count == 1:
+            return resp_503
+        # Second call hangs
+        try:
+            await asyncio.sleep(10.0)
+        except asyncio.CancelledError:
+            retry_cancelled = True
+            raise
+
+    start_mono = time.monotonic()
+    with patch.object(settings, "GEMINI_MODEL", "gemini-primary-test"):
+        with patch.object(settings, "GEMINI_FALLBACK_MODEL", "gemini-fallback-test"):
+            with patch.object(settings, "GEMINI_API_KEY", "mock-test-key-503-strict"):
+                # Request timeout is 0.2s, but cumulative deadline is 10.0s (budget remaining!)
+                with patch.object(settings, "AI_REQUEST_TIMEOUT", 0.2):
+                    with patch("api.services.llm_provider.AI_CUMULATIVE_DEADLINE", 10.0):
+                        with patch("random.uniform", return_value=0.01):
+                            with patch("httpx.AsyncClient.post", side_effect=fake_post):
+                                with pytest.raises(AIError) as exc_info:
+                                    await llm_provider.generate_json("Prompt for hanging retry termination", None)
+
+    elapsed_total = time.monotonic() - start_mono
+
+    # 1. Error is structured TIMEOUT
+    assert exc_info.value.kind == AIErrorKind.TIMEOUT
+    # 2. Retry was cancelled
+    assert retry_cancelled is True
+    # 3. Exactly 2 calls made (primary attempt 1 and primary retry 1; NO attempt 3 to fallback model)
+    assert call_count == 2
+    assert all("gemini-primary-test" in url for url in called_urls)
+    assert not any("gemini-fallback-test" in url for url in called_urls)
+    # 4. Total elapsed was well below cumulative deadline (10.0s), not hanging 10.0s
+    assert elapsed_total < 5.0
+
+
+@pytest.mark.asyncio
+async def test_503_with_insufficient_budget_terminates_at_one_call_without_fallback():
+    """Verify that primary 503 with insufficient backoff budget raises original 503 error after exactly 1 HTTP call."""
+    resp_503 = MagicMock(spec=httpx.Response)
+    resp_503.status_code = 503
+    resp_503.text = json.dumps({
+        "error": {
+            "code": 503,
+            "message": "Model overloaded.",
+            "status": "UNAVAILABLE"
+        }
+    })
+    resp_503.headers = {"retry-after": "5.0"}
+
+    call_count = 0
+    called_urls = []
+
+    async def fake_post(url, *args, **kwargs):
+        nonlocal call_count, called_urls
+        call_count += 1
+        called_urls.append(url)
+        return resp_503
+
+    with patch.object(settings, "GEMINI_MODEL", "gemini-primary-test"):
+        with patch.object(settings, "GEMINI_FALLBACK_MODEL", "gemini-fallback-test"):
+            with patch.object(settings, "GEMINI_API_KEY", "mock-test-key-503-strict"):
+                # delay is min(5.0, 2.5) + 0.3 = 2.8s; delay + 0.5 = 3.3s. Setting deadline to 3.0s ensures rem_before_sleep (<=3.0) < 3.3s
+                with patch("random.uniform", return_value=0.3):
+                    with patch("api.services.llm_provider.AI_CUMULATIVE_DEADLINE", 3.0):
+                        with patch("httpx.AsyncClient.post", side_effect=fake_post):
+                            with pytest.raises(AIError) as exc_info:
+                                await llm_provider.generate_json("Prompt for insufficient budget", None)
+
+    # 1. Error is original SERVICE_UNAVAILABLE from the first attempt
+    assert exc_info.value.kind == AIErrorKind.SERVICE_UNAVAILABLE
+    assert exc_info.value.status_code == 503
+    # 2. Exactly 1 call made (no retry and no fallback)
+    assert call_count == 1
+    assert "gemini-primary-test" in called_urls[0]
+    assert not any("gemini-fallback-test" in url for url in called_urls)
+
+
+@pytest.mark.asyncio
+async def test_503_followed_by_successful_retry_returns_with_exactly_two_calls():
+    """Verify that primary 503 followed by successful retry returns cleanly after exactly 2 HTTP calls."""
+    resp_503 = MagicMock(spec=httpx.Response)
+    resp_503.status_code = 503
+    resp_503.text = json.dumps({
+        "error": {
+            "code": 503,
+            "message": "Model overloaded.",
+            "status": "UNAVAILABLE"
+        }
+    })
+    resp_503.headers = {"retry-after": "0.01"}
+
+    resp_200 = MagicMock(spec=httpx.Response)
+    resp_200.status_code = 200
+    resp_200.json.return_value = {
+        "candidates": [{
+            "content": {
+                "parts": [{"text": '{"result": "successful_retry_data"}'}]
+            }
+        }]
+    }
+
+    call_count = 0
+    called_urls = []
+
+    async def fake_post(url, *args, **kwargs):
+        nonlocal call_count, called_urls
+        call_count += 1
+        called_urls.append(url)
+        if call_count == 1:
+            return resp_503
+        return resp_200
+
+    with patch.object(settings, "GEMINI_MODEL", "gemini-primary-test"):
+        with patch.object(settings, "GEMINI_FALLBACK_MODEL", "gemini-fallback-test"):
+            with patch.object(settings, "GEMINI_API_KEY", "mock-test-key-503-strict"):
+                with patch("random.uniform", return_value=0.01):
+                    with patch("httpx.AsyncClient.post", side_effect=fake_post):
+                        res = await llm_provider.generate_json("Prompt for successful retry", None)
+
+    assert res == {"result": "successful_retry_data"}
+    assert call_count == 2
+    assert all("gemini-primary-test" in url for url in called_urls)
+    assert not any("gemini-fallback-test" in url for url in called_urls)
+
+
+@pytest.mark.asyncio
+async def test_non_503_error_preserves_fallback_behavior():
+    """Verify that non-503 errors (e.g. 500) on primary model preserve fallback to secondary model."""
+    resp_500 = MagicMock(spec=httpx.Response)
+    resp_500.status_code = 500
+    resp_500.text = json.dumps({
+        "error": {
+            "code": 500,
+            "message": "Internal server error.",
+            "status": "INTERNAL"
+        }
+    })
+    resp_500.headers = {}
+
+    resp_200 = MagicMock(spec=httpx.Response)
+    resp_200.status_code = 200
+    resp_200.json.return_value = {
+        "candidates": [{
+            "content": {
+                "parts": [{"text": '{"fallback_success": true}'}]
+            }
+        }]
+    }
+
+    call_count = 0
+    called_urls = []
+
+    async def fake_post(url, *args, **kwargs):
+        nonlocal call_count, called_urls
+        call_count += 1
+        called_urls.append(url)
+        if call_count == 1:
+            return resp_500
+        return resp_200
+
+    with patch.object(settings, "GEMINI_MODEL", "gemini-primary-test"):
+        with patch.object(settings, "GEMINI_FALLBACK_MODEL", "gemini-fallback-test"):
+            with patch.object(settings, "GEMINI_API_KEY", "mock-test-key-503-strict"):
+                with patch("httpx.AsyncClient.post", side_effect=fake_post):
+                    res = await llm_provider.generate_json("Prompt for non-503 fallback", None)
+
+    assert res == {"fallback_success": True}
+    assert call_count == 2
+    assert "gemini-primary-test" in called_urls[0]
+    assert "gemini-fallback-test" in called_urls[1]
