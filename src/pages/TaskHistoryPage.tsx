@@ -19,6 +19,14 @@ export const TaskHistoryPage: React.FC = () => {
   const [loading, setLoading] = useState(true);
   const [statusFilter, setStatusFilter] = useState('all');
 
+  const FILTERS = [
+    { id: 'all', label: 'All' },
+    { id: 'completed', label: 'Completed' },
+    { id: 'executing', label: 'Executing' },
+    { id: 'awaiting_payment', label: 'Awaiting Payment' },
+    { id: 'failed', label: 'Failed' },
+  ];
+
   useEffect(() => {
     async function fetchTasks() {
       try {
@@ -34,9 +42,31 @@ export const TaskHistoryPage: React.FC = () => {
     fetchTasks();
   }, []);
 
-  const filteredTasks = statusFilter === 'all' 
-    ? tasks 
-    : tasks.filter(t => t.status === statusFilter);
+  const filteredTasks = tasks.filter((t) => {
+    if (statusFilter === 'all') return true;
+    if (statusFilter === 'completed') {
+      return t.status === 'completed' || t.status === 'paid';
+    }
+    if (statusFilter === 'executing') {
+      return t.status === 'executing' || t.status === 'planning';
+    }
+    if (statusFilter === 'awaiting_payment') {
+      return t.status === 'awaiting_payment';
+    }
+    if (statusFilter === 'failed') {
+      return t.status === 'failed';
+    }
+    return t.status === statusFilter;
+  });
+
+  const getFilterCount = (filterId: string) => {
+    if (filterId === 'all') return tasks.length;
+    if (filterId === 'completed') return tasks.filter(t => t.status === 'completed' || t.status === 'paid').length;
+    if (filterId === 'executing') return tasks.filter(t => t.status === 'executing' || t.status === 'planning').length;
+    if (filterId === 'awaiting_payment') return tasks.filter(t => t.status === 'awaiting_payment').length;
+    if (filterId === 'failed') return tasks.filter(t => t.status === 'failed').length;
+    return tasks.filter(t => t.status === filterId).length;
+  };
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
@@ -58,20 +88,31 @@ export const TaskHistoryPage: React.FC = () => {
         </div>
 
         {/* Filter Pills */}
-        <div className="flex items-center gap-2 bg-navy-900 p-1 rounded-xl border border-slate-800 text-xs">
-          {['all', 'completed', 'executing', 'awaiting_payment'].map((st) => (
-            <button
-              key={st}
-              onClick={() => setStatusFilter(st)}
-              className={`px-3 py-1.5 rounded-lg capitalize transition-colors ${
-                statusFilter === st
-                  ? 'bg-cyan-500 text-navy-950 font-bold'
-                  : 'text-slate-400 hover:text-white'
-              }`}
-            >
-              {st.replace('_', ' ')}
-            </button>
-          ))}
+        <div className="flex flex-wrap items-center gap-1.5 bg-navy-900 p-1.5 rounded-xl border border-slate-800 text-xs">
+          {FILTERS.map((f) => {
+            const count = getFilterCount(f.id);
+            const isSelected = statusFilter === f.id;
+            return (
+              <button
+                key={f.id}
+                onClick={() => setStatusFilter(f.id)}
+                className={`px-3 py-1.5 rounded-lg transition-all flex items-center gap-1.5 ${
+                  isSelected
+                    ? 'bg-cyan-500 text-navy-950 font-bold shadow-sm shadow-cyan-500/20'
+                    : 'text-slate-400 hover:text-white hover:bg-slate-800/60'
+                }`}
+              >
+                <span>{f.label}</span>
+                <span className={`text-[10px] font-mono px-1.5 py-0.2 rounded-full ${
+                  isSelected
+                    ? 'bg-navy-950/20 text-navy-950 font-extrabold'
+                    : 'bg-navy-950 text-slate-500'
+                }`}>
+                  {count}
+                </span>
+              </button>
+            );
+          })}
         </div>
       </div>
 
@@ -82,8 +123,17 @@ export const TaskHistoryPage: React.FC = () => {
           <span className="text-xs font-mono">Loading task archive...</span>
         </div>
       ) : filteredTasks.length === 0 ? (
-        <div className="py-20 text-center text-slate-500 text-sm">
-          No workflows found for the selected filter.
+        <div className="py-20 text-center text-slate-500 text-sm glass-panel rounded-2xl border border-slate-800/80 p-8">
+          <p className="font-medium text-slate-400">
+            {statusFilter === 'all'
+              ? 'No workflows found in execution ledger. Launch your first task above.'
+              : statusFilter === 'completed'
+              ? 'No completed or paid workflows found.'
+              : `No workflows found with status "${statusFilter.replace('_', ' ')}".`}
+          </p>
+          <p className="text-xs text-slate-500 mt-1">
+            Switch filter or click "Dispatch New Task" to create a multi-agent pipeline.
+          </p>
         </div>
       ) : (
         <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6">
@@ -97,11 +147,15 @@ export const TaskHistoryPage: React.FC = () => {
                   <span className={`text-[10px] font-mono font-bold px-2 py-0.5 rounded uppercase ${
                     t.status === 'completed'
                       ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                      : t.status === 'paid'
+                      ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
                       : t.status === 'awaiting_payment'
                       ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
-                      : 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
+                      : t.status === 'failed'
+                      ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
+                      : 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
                   }`}>
-                    {t.status.replace('_', ' ')}
+                    {t.status === 'paid' ? 'Paid (Settled)' : t.status.replace('_', ' ')}
                   </span>
                   <span className="text-[10px] text-slate-500 font-mono">
                     {new Date(t.created_at).toLocaleDateString()}

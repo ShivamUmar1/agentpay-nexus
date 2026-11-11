@@ -21,32 +21,57 @@ export const MarketplacePage: React.FC = () => {
 
   // Filters
   const [search, setSearch] = useState('');
+  const [debouncedSearch, setDebouncedSearch] = useState('');
   const [selectedCategory, setSelectedCategory] = useState('All');
   const [sortBy, setSortBy] = useState('rating');
   const [selectedAgent, setSelectedAgent] = useState<Agent | null>(null);
 
+  // Debounce search input by 300ms to prevent excessive API requests while typing
   useEffect(() => {
+    const timer = setTimeout(() => {
+      setDebouncedSearch(search);
+    }, 300);
+
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [search]);
+
+  useEffect(() => {
+    let isCurrent = true;
+
     async function loadData() {
       try {
         setLoading(true);
+        setError(null);
         const [agentsRes, catRes] = await Promise.all([
           api.getAgents({
             category: selectedCategory !== 'All' ? selectedCategory : undefined,
-            search: search || undefined,
+            search: debouncedSearch.trim() || undefined,
             sort_by: sortBy
           }),
           api.getCategories()
         ]);
-        setAgents(agentsRes.agents);
-        setCategories(['All', ...catRes]);
+        if (isCurrent) {
+          setAgents(agentsRes.agents);
+          setCategories(['All', ...catRes]);
+        }
       } catch (err: any) {
-        setError(err.message || 'Failed to load marketplace agents.');
+        if (isCurrent) {
+          setError(err.message || 'Failed to load marketplace agents.');
+        }
       } finally {
-        setLoading(false);
+        if (isCurrent) {
+          setLoading(false);
+        }
       }
     }
     loadData();
-  }, [selectedCategory, search, sortBy]);
+
+    return () => {
+      isCurrent = false;
+    };
+  }, [selectedCategory, debouncedSearch, sortBy]);
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">

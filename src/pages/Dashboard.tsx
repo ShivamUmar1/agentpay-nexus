@@ -147,17 +147,68 @@ export const Dashboard: React.FC = () => {
 
       {/* Main Grid: Tasks Table & Activity Chart */}
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
-        {/* Left Column (8 cols): Tasks Table */}
-        <div className="lg:col-span-8 space-y-4">
-          <div className="flex items-center justify-between">
-            <h3 className="text-sm font-mono font-semibold uppercase text-slate-300 tracking-wider">
-              Recent Multi-Agent Pipelines
-            </h3>
-            <Link to="/tasks" className="text-xs text-cyan-400 hover:text-cyan-300 font-mono flex items-center gap-1">
-              <span>View All</span>
-              <ArrowUpRight className="w-3.5 h-3.5" />
-            </Link>
+        {/* Left Column (8 cols): Activity Chart & Tasks Table */}
+        <div className="lg:col-span-8 space-y-6">
+          {/* Operations Activity & Throughput Chart */}
+          <div className="glass-panel rounded-2xl p-5 border border-slate-800 space-y-4">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pb-3 border-b border-slate-800/80">
+              <div className="flex items-center gap-2">
+                <TrendingUp className="w-4 h-4 text-cyan-400" />
+                <h3 className="text-sm font-mono font-semibold uppercase text-slate-200 tracking-wider">
+                  Pipeline Throughput & Settlement Velocity
+                </h3>
+              </div>
+              <div className="flex items-center gap-4 text-xs font-mono">
+                <span className="flex items-center gap-1.5 text-cyan-400">
+                  <span className="w-2.5 h-2.5 rounded-sm bg-cyan-400 inline-block"></span>
+                  Workflows
+                </span>
+                <span className="flex items-center gap-1.5 text-blue-400">
+                  <span className="w-2.5 h-2.5 rounded-sm bg-blue-500 inline-block"></span>
+                  Spend ($ USD)
+                </span>
+              </div>
+            </div>
+
+            {totalTasks === 0 && totalSpent === 0 ? (
+              <div className="h-48 flex flex-col items-center justify-center text-slate-500 text-xs space-y-1.5 border border-dashed border-slate-800 rounded-xl bg-navy-950/40">
+                <Activity className="w-6 h-6 text-slate-600 mb-1" />
+                <span className="font-mono text-slate-400">No Activity Recorded Yet</span>
+                <span className="text-[11px] text-slate-500">Dispatch a new task to generate real-time execution metrics.</span>
+              </div>
+            ) : (
+              <div className="h-56 w-full pt-2">
+                <ResponsiveContainer width="100%" height="100%">
+                  <BarChart data={activityData} margin={{ top: 10, right: 10, left: -20, bottom: 0 }}>
+                    <XAxis dataKey="name" stroke="#64748B" fontSize={11} tickLine={false} axisLine={{ stroke: '#334155' }} />
+                    <YAxis stroke="#64748B" fontSize={11} tickLine={false} axisLine={{ stroke: '#334155' }} />
+                    <Tooltip
+                      contentStyle={{ backgroundColor: '#070B14', borderColor: '#334155', borderRadius: 8, fontSize: 12 }}
+                      itemStyle={{ color: '#00F0FF' }}
+                      formatter={(value: any, name: any) => [
+                        name === 'spend' ? `$${Number(value).toFixed(2)} USD` : value,
+                        name === 'spend' ? 'Spend' : 'Workflows'
+                      ]}
+                    />
+                    <Bar dataKey="tasks" name="tasks" fill="#00F0FF" radius={[4, 4, 0, 0]} maxBarSize={40} />
+                    <Bar dataKey="spend" name="spend" fill="#3B82F6" radius={[4, 4, 0, 0]} maxBarSize={40} />
+                  </BarChart>
+                </ResponsiveContainer>
+              </div>
+            )}
           </div>
+
+          {/* Recent Multi-Agent Pipelines */}
+          <div className="space-y-4">
+            <div className="flex items-center justify-between">
+              <h3 className="text-sm font-mono font-semibold uppercase text-slate-300 tracking-wider">
+                Recent Multi-Agent Pipelines
+              </h3>
+              <Link to="/tasks" className="text-xs text-cyan-400 hover:text-cyan-300 font-mono flex items-center gap-1">
+                <span>View All</span>
+                <ArrowUpRight className="w-3.5 h-3.5" />
+              </Link>
+            </div>
 
           <div className="glass-panel rounded-2xl border border-slate-800 overflow-hidden">
             {tasks.length === 0 ? (
@@ -208,6 +259,7 @@ export const Dashboard: React.FC = () => {
             )}
           </div>
         </div>
+      </div>
 
         {/* Right Column (4 cols): PayPal Transactions Feed */}
         <div className="lg:col-span-4 space-y-4">

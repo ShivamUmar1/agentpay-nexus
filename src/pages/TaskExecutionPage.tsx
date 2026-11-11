@@ -34,7 +34,8 @@ import {
   ArrowRight,
   ExternalLink,
   Loader2,
-  Info
+  Info,
+  Clock
 } from 'lucide-react';
 import { Task, TaskStep, ActivityLog, PaymentSummary } from '../types';
 import { api } from '../services/api';
@@ -200,17 +201,34 @@ export const TaskExecutionPage: React.FC = () => {
     }
   };
 
+  const getEffectiveReportMarkdown = () => {
+    if (!task) return null;
+    if (task.final_output?.report_markdown) {
+      return task.final_output.report_markdown;
+    }
+    const isSettled = task.status === 'paid' || task.status === 'completed';
+    if (isSettled) {
+      const contentStep = task.steps?.find(s => s.step_name === 'content_generation');
+      if (contentStep?.output_data?.report_markdown && !contentStep?.output_data?.is_locked) {
+        return contentStep.output_data.report_markdown;
+      }
+    }
+    return null;
+  };
+
   const handleCopyReport = () => {
-    if (task?.final_output?.report_markdown) {
-      navigator.clipboard.writeText(task.final_output.report_markdown);
+    const reportMd = getEffectiveReportMarkdown();
+    if (reportMd) {
+      navigator.clipboard.writeText(reportMd);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     }
   };
 
   const handleDownloadMarkdown = () => {
-    if (!task?.final_output?.report_markdown) return;
-    const blob = new Blob([task.final_output.report_markdown], { type: 'text/markdown' });
+    const reportMd = getEffectiveReportMarkdown();
+    if (!reportMd || !task) return;
+    const blob = new Blob([reportMd], { type: 'text/markdown' });
     const url = URL.createObjectURL(blob);
     const a = document.createElement('a');
     a.href = url;
@@ -229,6 +247,99 @@ export const TaskExecutionPage: React.FC = () => {
   }
 
   if (!task) {
+    // Dedicated PayPal return recovery screen for unlinked session returns
+    if (isApproved && token) {
+      return (
+        <div className="max-w-2xl mx-auto py-16 px-4 animate-fadeIn">
+          <div className="glass-panel rounded-2xl p-6 sm:p-8 border border-amber-500/40 bg-navy-950/85 shadow-2xl space-y-6">
+            <div className="flex items-start gap-4 pb-5 border-b border-slate-800">
+              <div className="w-12 h-12 rounded-xl bg-amber-500/10 border border-amber-500/30 flex items-center justify-center shrink-0">
+                <AlertTriangle className="w-6 h-6 text-amber-400" />
+              </div>
+              <div className="space-y-1">
+                <div className="flex items-center gap-2">
+                  <span className="text-[10px] font-mono px-2 py-0.5 rounded font-bold uppercase bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                    PAYPAL RETURN DETECTED
+                  </span>
+                  <span className="text-[10px] font-mono text-slate-400">
+                    ORDER: {token.length > 17 ? `${token.slice(0, 14)}...` : token}
+                  </span>
+                </div>
+                <h2 className="text-xl font-bold text-white tracking-tight">
+                  Session Authentication Required
+                </h2>
+                <p className="text-xs text-slate-300 leading-relaxed">
+                  Your browser returned from PayPal Checkout with buyer authorization, but cannot access the execution ledger for this task under your current session.
+                </p>
+              </div>
+            </div>
+
+            {/* Critical Security Notices */}
+            <div className="space-y-3 text-xs">
+              <div className="p-4 rounded-xl bg-amber-950/40 border border-amber-500/30 text-amber-200/90 space-y-1.5">
+                <div className="font-bold flex items-center gap-1.5 text-amber-300">
+                  <ShieldCheck className="w-4 h-4 text-amber-400 shrink-0" />
+                  <span>Important: Do Not Re-Authorize or Pay Again</span>
+                </div>
+                <p className="text-[11px] leading-relaxed">
+                  PayPal registered your authorization under Order ID <span className="font-mono text-white font-semibold">{token}</span>. Do not initiate another checkout session or attempt to pay again.
+                </p>
+              </div>
+
+              <div className="p-4 rounded-xl bg-navy-900 border border-slate-800 text-slate-300 space-y-1.5">
+                <div className="font-bold flex items-center gap-1.5 text-slate-200">
+                  <Info className="w-4 h-4 text-cyan-400 shrink-0" />
+                  <span>Payment Settlement Status Unverified on this Screen</span>
+                </div>
+                <p className="text-[11px] leading-relaxed text-slate-400">
+                  To protect task deliverables and financial privacy, the server restricts task inspection and capture triggers to the verified session that formulated the execution graph. Payment capture has NOT been executed by this screen.
+                </p>
+              </div>
+
+              <div className="p-4 rounded-xl bg-navy-900 border border-slate-800 text-slate-300 space-y-1.5">
+                <div className="font-bold flex items-center gap-1.5 text-slate-200">
+                  <ExternalLink className="w-4 h-4 text-blue-400 shrink-0" />
+                  <span>How to Complete Settlement & View Your Report</span>
+                </div>
+                <p className="text-[11px] leading-relaxed text-slate-400">
+                  If you launched this task from a different browser window, private/incognito profile, or device, please return to that original session and reload the task URL. The original session will verify your approval and unlock the deliverable.
+                </p>
+              </div>
+            </div>
+
+            {/* Actions */}
+            <div className="pt-4 border-t border-slate-800 flex flex-col sm:flex-row items-center justify-between gap-3">
+              <button
+                onClick={() => {
+                  setLoading(true);
+                  loadTaskData();
+                }}
+                className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-navy-800 hover:bg-slate-700 text-slate-200 border border-slate-700 hover:border-cyan-500/40 text-xs font-semibold flex items-center justify-center gap-2 transition-colors"
+              >
+                <RotateCw className="w-3.5 h-3.5 text-cyan-400" />
+                <span>Retry Session Verification</span>
+              </button>
+
+              <div className="flex items-center gap-2 w-full sm:w-auto">
+                <Link
+                  to="/tasks"
+                  className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-navy-800 hover:bg-slate-700 text-slate-300 text-xs font-semibold text-center transition-colors border border-slate-700"
+                >
+                  My Workflows
+                </Link>
+                <Link
+                  to="/marketplace"
+                  className="w-full sm:w-auto px-4 py-2.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-navy-950 font-bold text-xs text-center transition-colors shadow-md shadow-cyan-500/20"
+                >
+                  Marketplace
+                </Link>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
     return (
       <div className="max-w-xl mx-auto py-20 text-center">
         <AlertCircle className="w-10 h-10 text-rose-400 mx-auto mb-3" />
@@ -241,11 +352,43 @@ export const TaskExecutionPage: React.FC = () => {
     );
   }
 
+  const isPaid = task.status === 'paid';
   const isCompleted = task.status === 'completed';
   const isAwaitingPayment = task.status === 'awaiting_payment';
   const isFailed = task.status === 'failed';
-  const chartData = task.final_output?.analysis_data?.chart_revenue_projections || [];
-  const marketShareData = task.final_output?.analysis_data?.market_share_breakdown || [];
+
+  // Step outputs resolution
+  const contentStep = task.steps?.find(s => s.step_name === 'content_generation');
+  const analysisStep = task.steps?.find(s => s.step_name === 'data_analysis');
+  const qaStep = task.steps?.find(s => s.step_name === 'quality_assurance');
+  const deliveryStep = task.steps?.find(s => s.step_name === 'final_delivery');
+
+  // Derive unlocked report markdown:
+  // 1. From task.final_output.report_markdown if populated
+  // 2. Or from content_generation step output when unlocked post-settlement (isPaid or isCompleted)
+  const unlockedContentReport =
+    (isPaid || isCompleted) &&
+    contentStep?.output_data?.report_markdown &&
+    !contentStep?.output_data?.is_locked
+      ? contentStep.output_data.report_markdown
+      : null;
+
+  const effectiveReportMarkdown =
+    task.final_output?.report_markdown || unlockedContentReport || null;
+
+  // Derive quantitative analysis data (charts)
+  const effectiveAnalysisData =
+    task.final_output?.analysis_data || analysisStep?.output_data || null;
+
+  const chartData = effectiveAnalysisData?.chart_revenue_projections || [];
+  const marketShareData = effectiveAnalysisData?.market_share_breakdown || [];
+
+  // Derive QA audit data
+  const effectiveQaAudit =
+    task.final_output?.qa_audit || qaStep?.output_data || null;
+
+  const hasDeliverable = Boolean(effectiveReportMarkdown);
+  const shouldShowDeliverable = (isPaid || isCompleted) && hasDeliverable;
 
   return (
     <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 space-y-6">
@@ -340,13 +483,15 @@ export const TaskExecutionPage: React.FC = () => {
             <span className={`text-[10px] font-mono px-2 py-0.5 rounded font-bold uppercase ${
               isCompleted
                 ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                : isPaid
+                ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
                 : isAwaitingPayment
                 ? 'bg-amber-500/20 text-amber-300 border border-amber-500/30 animate-pulse'
                 : isFailed
                 ? 'bg-rose-500/20 text-rose-300 border border-rose-500/30'
-                : 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
+                : 'bg-blue-500/20 text-blue-300 border border-blue-500/30'
             }`}>
-              {task.status.replace('_', ' ')}
+              {isPaid ? 'Payment Settled (Paid)' : task.status.replace('_', ' ')}
             </span>
             <span className="text-xs text-slate-400 font-mono">ID: {task.id.slice(0, 13)}...</span>
           </div>
@@ -368,8 +513,8 @@ export const TaskExecutionPage: React.FC = () => {
             </div>
           </div>
 
-          {/* Stepper / Auto-Run Action */}
-          {!isCompleted && !isAwaitingPayment && !isFailed && (
+          {/* Stepper / Auto-Run Action: only for active executing workflows */}
+          {!isCompleted && !isPaid && !isAwaitingPayment && !isFailed && (
             <div className="flex items-center gap-2">
               <button
                 onClick={() => setAutoRun(!autoRun)}
@@ -405,8 +550,8 @@ export const TaskExecutionPage: React.FC = () => {
             </button>
           )}
 
-          {/* Download button if completed */}
-          {isCompleted && (
+          {/* Download & Copy buttons if deliverable is ready (paid or completed) */}
+          {(isCompleted || isPaid) && hasDeliverable && (
             <div className="flex items-center gap-2">
               <button
                 onClick={handleCopyReport}
@@ -450,8 +595,8 @@ export const TaskExecutionPage: React.FC = () => {
       <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
         {/* Left Column (8 cols): Deliverable View or Active Step Inspector */}
         <div className="lg:col-span-7 space-y-6">
-          {/* If completed: Full Final Deliverable */}
-          {isCompleted && task.final_output ? (
+          {/* If deliverable is ready (paid or completed): Full Final Deliverable */}
+          {shouldShowDeliverable ? (
             <div className="glass-panel rounded-2xl p-6 border border-slate-800 space-y-6">
               {/* Deliverable Header & Tabs */}
               <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-4 border-b border-slate-800">
@@ -461,16 +606,18 @@ export const TaskExecutionPage: React.FC = () => {
                   </div>
                   <div>
                     <h3 className="font-bold text-base text-white">
-                      {task.final_output.qa_audit?.factual_verification_status === 'VERIFIED_EMPIRICAL'
+                      {effectiveQaAudit?.factual_verification_status === 'VERIFIED_EMPIRICAL'
                         ? 'Independently Verified Empirical Deliverable'
-                        : task.final_output.qa_audit?.factual_verification_status === 'USER_PROVIDED'
+                        : effectiveQaAudit?.factual_verification_status === 'USER_PROVIDED'
                         ? 'User-Provided Benchmark Analysis'
                         : 'Qualitative AI Synthesis Deliverable'}
                     </h3>
                     <p className="text-[11px] text-slate-400 font-mono">
-                      {task.final_output.qa_audit?.factual_verification_status === 'VERIFIED_EMPIRICAL'
+                      {isPaid && deliveryStep?.status === 'pending'
+                        ? 'Payment verified on PayPal Sandbox ($8.00 USD) • Deliverable unlocked.'
+                        : effectiveQaAudit?.factual_verification_status === 'VERIFIED_EMPIRICAL'
                         ? 'Empirically verified against primary records • Payment captured.'
-                        : task.final_output.qa_audit?.factual_verification_status === 'USER_PROVIDED'
+                        : effectiveQaAudit?.factual_verification_status === 'USER_PROVIDED'
                         ? 'Calculated from user inputs (Not externally verified) • Payment captured.'
                         : 'Internal consistency certified • Suggested leads (Not independently fact-verified)'}
                     </p>
@@ -510,7 +657,7 @@ export const TaskExecutionPage: React.FC = () => {
               {activeTab === 'report' && (
                 <div className="prose prose-invert prose-cyan max-w-none text-slate-300 text-xs sm:text-sm leading-relaxed space-y-4">
                   <ReactMarkdown>
-                    {task.final_output.report_markdown || 'No report content available.'}
+                    {effectiveReportMarkdown || 'No report content available.'}
                   </ReactMarkdown>
                 </div>
               )}
@@ -545,7 +692,7 @@ export const TaskExecutionPage: React.FC = () => {
                         Market Share Breakdown (%)
                       </h4>
                       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-                        {marketShareData.map((item, idx) => (
+                        {marketShareData.map((item: { label: string; value: number }, idx: number) => (
                           <div key={idx} className="p-3 rounded-lg bg-navy-900 border border-slate-800 text-center">
                             <span className="text-xs text-slate-400 block truncate">{item.label}</span>
                             <span className="text-lg font-bold text-white font-mono">{item.value}%</span>
@@ -565,7 +712,7 @@ export const TaskExecutionPage: React.FC = () => {
                     <div>
                       <h4 className="text-sm font-bold text-white">Quality Assurance Certification Stamp</h4>
                       <p className="text-xs text-slate-300 mt-1">
-                        {task.final_output.qa_audit?.feedback || 'All requirements, quantitative metrics, and constraints verified.'}
+                        {effectiveQaAudit?.feedback || 'All requirements, quantitative metrics, and constraints verified.'}
                       </p>
                     </div>
                   </div>
@@ -574,13 +721,13 @@ export const TaskExecutionPage: React.FC = () => {
                     <div className="p-4 rounded-xl bg-navy-950 border border-slate-800 text-center">
                       <span className="text-xs text-slate-400 font-mono block mb-1">Completeness Score</span>
                       <span className="text-2xl font-extrabold text-cyan-400 font-mono">
-                        {task.final_output.qa_audit?.completeness_score || 98} / 100
+                        {effectiveQaAudit?.completeness_score || 98} / 100
                       </span>
                     </div>
                     <div className="p-4 rounded-xl bg-navy-950 border border-slate-800 text-center">
                       <span className="text-xs text-slate-400 font-mono block mb-1">Internal Consistency</span>
                       <span className="text-2xl font-extrabold text-emerald-400 font-mono">
-                        {task.final_output.qa_audit?.factual_coherence_score || 96} / 100
+                        {effectiveQaAudit?.factual_coherence_score || 96} / 100
                       </span>
                       <span className="text-[10px] text-slate-500 block mt-0.5">Structural coherence (Internal)</span>
                     </div>
@@ -591,29 +738,45 @@ export const TaskExecutionPage: React.FC = () => {
                     <div>
                       <span className="text-slate-400 font-mono block text-[11px]">External Factual Verification:</span>
                       <span className="text-[11px] text-slate-300">
-                        {task.final_output.qa_audit?.factual_verification_status === 'VERIFIED_EMPIRICAL'
+                        {effectiveQaAudit?.factual_verification_status === 'VERIFIED_EMPIRICAL'
                           ? 'Empirically checked against primary research citations.'
-                          : task.final_output.qa_audit?.factual_verification_status === 'USER_PROVIDED'
+                          : effectiveQaAudit?.factual_verification_status === 'USER_PROVIDED'
                           ? 'Calculated deterministically from user parameters; not externally verified.'
                           : 'Qualitative AI synthesis with suggested leads (Not independently verified against external records).'}
                       </span>
                     </div>
                     <span className={`px-2 py-0.5 rounded font-mono font-semibold text-[10px] uppercase shrink-0 ${
-                      task.final_output.qa_audit?.factual_verification_status === 'VERIFIED_EMPIRICAL'
+                      effectiveQaAudit?.factual_verification_status === 'VERIFIED_EMPIRICAL'
                         ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                        : task.final_output.qa_audit?.factual_verification_status === 'USER_PROVIDED'
+                        : effectiveQaAudit?.factual_verification_status === 'USER_PROVIDED'
                         ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/30'
                         : 'bg-amber-500/20 text-amber-300 border border-amber-500/30'
                     }`}>
-                      {task.final_output.qa_audit?.factual_verification_status === 'VERIFIED_EMPIRICAL'
+                      {effectiveQaAudit?.factual_verification_status === 'VERIFIED_EMPIRICAL'
                         ? 'Empirically Verified'
-                        : task.final_output.qa_audit?.factual_verification_status === 'USER_PROVIDED'
+                        : effectiveQaAudit?.factual_verification_status === 'USER_PROVIDED'
                         ? 'User Benchmark'
                         : 'Qualitative AI Synthesis'}
                     </span>
                   </div>
                 </div>
               )}
+            </div>
+          ) : (isPaid || isCompleted) && !hasDeliverable ? (
+            <div className="glass-panel rounded-2xl p-8 border border-cyan-500/30 bg-navy-950/70 text-center space-y-4">
+              <div className="w-12 h-12 rounded-xl bg-cyan-500/10 border border-cyan-500/30 flex items-center justify-center mx-auto text-cyan-400">
+                <Clock className="w-6 h-6 animate-pulse" />
+              </div>
+              <div>
+                <h3 className="text-base font-bold text-white">Payment Verified & Settled</h3>
+                <p className="text-xs text-slate-400 max-w-md mx-auto mt-1 leading-relaxed">
+                  Your payment of ${task.total_cost.toFixed(2)} USD is verified on the database ledger. The deliverable package is currently compiling from multi-agent nodes.
+                </p>
+              </div>
+              <div className="flex items-center justify-center gap-2 text-[11px] font-mono text-cyan-400">
+                <span className="w-2 h-2 rounded-full bg-cyan-400 animate-pulse"></span>
+                <span>Ledger status: Paid • Awaiting deliverable assembly</span>
+              </div>
             </div>
           ) : (
             /* In-Progress / Step Inspector */

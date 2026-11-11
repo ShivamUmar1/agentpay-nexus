@@ -39,15 +39,41 @@ export const CreateTaskPage: React.FC = () => {
   const navigate = useNavigate();
   const [title, setTitle] = useState('');
   const [description, setDescription] = useState('');
-  const [budget, setBudget] = useState<number>(10.0);
+  const [budget, setBudget] = useState<string>('10.0');
+  const [budgetError, setBudgetError] = useState<string | null>(null);
   const [constraints, setConstraints] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  const validateBudget = (val: string): string | null => {
+    const trimmed = val.trim();
+    if (!trimmed) {
+      return 'Maximum budget is required.';
+    }
+    const num = parseFloat(trimmed);
+    if (isNaN(num) || !Number.isFinite(num)) {
+      return 'Budget must be a valid numeric amount.';
+    }
+    if (num <= 0) {
+      return 'Budget must be strictly greater than $0.00 USD.';
+    }
+    if (num > 1000.0) {
+      return 'Budget cannot exceed the platform limit of $1,000.00 USD.';
+    }
+    return null;
+  };
+
+  const handleBudgetChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = e.target.value;
+    setBudget(val);
+    setBudgetError(validateBudget(val));
+  };
+
   const applyPreset = (preset: typeof PRESETS[0]) => {
     setTitle(preset.title);
     setDescription(preset.description);
-    setBudget(preset.budget);
+    setBudget(preset.budget.toFixed(1));
+    setBudgetError(null);
     setConstraints(preset.constraints);
   };
 
@@ -58,15 +84,21 @@ export const CreateTaskPage: React.FC = () => {
       return;
     }
 
+    const bErr = validateBudget(budget);
+    if (bErr) {
+      setBudgetError(bErr);
+      return;
+    }
+
     try {
       setLoading(true);
       setError(null);
       const task = await api.createTask({
-        title,
-        description,
-        budget: Number(budget),
+        title: title.trim(),
+        description: description.trim(),
+        budget: parseFloat(budget),
         currency: 'USD',
-        constraints
+        constraints: constraints.trim() || undefined
       });
       navigate(`/tasks/${task.id}`);
     } catch (err: any) {
@@ -166,23 +198,39 @@ export const CreateTaskPage: React.FC = () => {
           <div>
             <label className="block text-xs font-mono font-semibold uppercase text-slate-300 mb-2 flex items-center justify-between">
               <span>Maximum Budget Limit (USD) *</span>
-              <span className="text-cyan-400 font-mono">${budget.toFixed(2)}</span>
+              <span className="text-cyan-400 font-mono">
+                ${!isNaN(parseFloat(budget)) && Number.isFinite(parseFloat(budget)) && parseFloat(budget) > 0 ? parseFloat(budget).toFixed(2) : '0.00'}
+              </span>
             </label>
             <div className="relative">
-              <DollarSign className="w-4 h-4 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+              <DollarSign className={`w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 transition-colors ${
+                budgetError ? 'text-rose-400' : 'text-slate-400'
+              }`} />
               <input
                 type="number"
-                min="5"
-                max="100"
+                min="0.01"
+                max="1000"
                 step="0.5"
                 value={budget}
-                onChange={(e) => setBudget(parseFloat(e.target.value) || 0)}
-                className="w-full pl-9 pr-4 py-2.5 rounded-xl bg-navy-950 border border-slate-800 text-sm font-mono text-white focus:outline-none focus:border-cyan-500/60"
+                onChange={handleBudgetChange}
+                placeholder="10.0"
+                className={`w-full pl-9 pr-4 py-2.5 rounded-xl bg-navy-950 border text-sm font-mono text-white focus:outline-none transition-colors ${
+                  budgetError
+                    ? 'border-rose-500/80 focus:border-rose-500 text-rose-200'
+                    : 'border-slate-800 focus:border-cyan-500/60'
+                }`}
               />
             </div>
-            <p className="text-[11px] text-slate-400 mt-1">
-              Standard 4-agent research pipeline costs $8.00 USD.
-            </p>
+            {budgetError ? (
+              <p className="text-[11px] text-rose-400 font-mono mt-1.5 flex items-center gap-1 animate-fadeIn">
+                <span className="font-bold">⚠</span>
+                <span>{budgetError}</span>
+              </p>
+            ) : (
+              <p className="text-[11px] text-slate-400 mt-1">
+                Standard 4-agent research pipeline costs $8.00 USD (platform max $1,000.00).
+              </p>
+            )}
           </div>
 
           {/* Constraints */}
@@ -209,7 +257,7 @@ export const CreateTaskPage: React.FC = () => {
 
           <button
             type="submit"
-            disabled={loading}
+            disabled={loading || Boolean(budgetError) || !budget.trim() || parseFloat(budget) <= 0}
             className="px-6 py-3 rounded-xl bg-gradient-to-r from-cyan-500 to-blue-600 hover:from-cyan-400 hover:to-blue-500 text-navy-950 font-bold text-sm flex items-center gap-2 shadow-lg shadow-cyan-500/20 disabled:opacity-50 transition-all"
           >
             {loading ? (

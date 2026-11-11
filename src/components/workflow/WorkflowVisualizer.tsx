@@ -51,9 +51,41 @@ export const WorkflowVisualizer: React.FC<WorkflowVisualizerProps> = ({
   onSelectStep,
   selectedStepId
 }) => {
+  const scrollContainerRef = React.useRef<HTMLDivElement>(null);
+  const [canScrollRight, setCanScrollRight] = React.useState(false);
+
+  const checkScroll = React.useCallback(() => {
+    if (scrollContainerRef.current) {
+      const { scrollLeft, scrollWidth, clientWidth } = scrollContainerRef.current;
+      setCanScrollRight(scrollWidth - (scrollLeft + clientWidth) > 12);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    checkScroll();
+    window.addEventListener('resize', checkScroll);
+    return () => window.removeEventListener('resize', checkScroll);
+  }, [checkScroll, steps]);
+
   return (
-    <div className="w-full overflow-x-auto py-4 px-2">
-      <div className="flex items-center justify-between min-w-[850px] gap-2">
+    <div className="relative w-full">
+      {/* Mobile-only scroll cue banner */}
+      {canScrollRight && (
+        <div className="md:hidden flex items-center justify-end px-2 pt-1 pb-0.5">
+          <span className="text-[10px] font-mono text-cyan-400/90 flex items-center gap-1 animate-pulse">
+            <span>Swipe to view nodes</span>
+            <ChevronRight className="w-3 h-3" />
+          </span>
+        </div>
+      )}
+
+      {/* Scrollable node graph */}
+      <div
+        ref={scrollContainerRef}
+        onScroll={checkScroll}
+        className="w-full overflow-x-auto py-4 px-2"
+      >
+        <div className="flex items-center justify-between min-w-[850px] gap-2">
         {steps.map((step, index) => {
           const isCompleted = step.status === 'completed';
           const isRunning = step.status === 'running' || currentStep === step.step_name;
@@ -139,6 +171,15 @@ export const WorkflowVisualizer: React.FC<WorkflowVisualizerProps> = ({
           );
         })}
       </div>
+    </div>
+
+      {/* Right-edge subtle gradient fade (pointer-events-none so touches and clicks pass through) */}
+      {canScrollRight && (
+        <div
+          className="md:hidden pointer-events-none absolute right-0 top-0 bottom-0 w-12 bg-gradient-to-l from-navy-950 via-navy-950/70 to-transparent"
+          aria-hidden="true"
+        />
+      )}
     </div>
   );
 };

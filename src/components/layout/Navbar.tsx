@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Link, useLocation } from 'react-router-dom';
 import { 
   Bot, 
@@ -11,7 +11,9 @@ import {
   LogOut, 
   ExternalLink,
   ChevronDown,
-  Sparkles
+  Sparkles,
+  Menu,
+  X
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 
@@ -19,8 +21,21 @@ export const Navbar: React.FC = () => {
   const location = useLocation();
   const { user, logout, loginAsGuest } = useAuth();
   const [menuOpen, setMenuOpen] = useState(false);
+  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
 
   const isActive = (path: string) => location.pathname === path;
+
+  // Close menus on Escape key
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') {
+        setMobileMenuOpen(false);
+        setMenuOpen(false);
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, []);
 
   return (
     <header className="sticky top-0 z-50 glass-panel border-b border-slate-800/80 bg-navy-950/80 backdrop-blur-md">
@@ -175,9 +190,92 @@ export const Navbar: React.FC = () => {
                 Sign In
               </button>
             )}
+            {/* Mobile Hamburger Button */}
+            <button
+              onClick={() => setMobileMenuOpen(!mobileMenuOpen)}
+              className="md:hidden p-2 rounded-xl bg-navy-900 border border-slate-800 text-slate-300 hover:text-white hover:border-cyan-500/40 focus:outline-none focus:ring-2 focus:ring-cyan-500/40 transition-colors"
+              aria-label={mobileMenuOpen ? 'Close navigation menu' : 'Open navigation menu'}
+              aria-expanded={mobileMenuOpen}
+              aria-controls="mobile-nav-drawer"
+            >
+              {mobileMenuOpen ? (
+                <X className="w-5 h-5 text-cyan-400" />
+              ) : (
+                <Menu className="w-5 h-5" />
+              )}
+            </button>
           </div>
         </div>
       </div>
+
+      {/* Mobile Navigation Drawer */}
+      {mobileMenuOpen && (
+        <nav
+          id="mobile-nav-drawer"
+          aria-label="Mobile Navigation"
+          className="md:hidden border-t border-slate-800/90 bg-navy-950/95 backdrop-blur-xl px-4 py-3 space-y-1 animate-fadeIn shadow-2xl"
+        >
+          <Link
+            to="/marketplace"
+            onClick={() => setMobileMenuOpen(false)}
+            className={`w-full px-3 py-2.5 rounded-xl transition-colors flex items-center gap-2.5 text-xs font-semibold ${
+              isActive('/marketplace')
+                ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30'
+                : 'text-slate-300 hover:text-white hover:bg-slate-800/60'
+            }`}
+          >
+            <Layers className="w-4 h-4 text-cyan-400" />
+            <span>Marketplace</span>
+          </Link>
+
+          <Link
+            to="/dashboard"
+            onClick={() => setMobileMenuOpen(false)}
+            className={`w-full px-3 py-2.5 rounded-xl transition-colors flex items-center gap-2.5 text-xs font-semibold ${
+              isActive('/dashboard')
+                ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30'
+                : 'text-slate-300 hover:text-white hover:bg-slate-800/60'
+            }`}
+          >
+            <Activity className="w-4 h-4 text-cyan-400" />
+            <span>Dashboard</span>
+          </Link>
+
+          <Link
+            to="/tasks"
+            onClick={() => setMobileMenuOpen(false)}
+            className={`w-full px-3 py-2.5 rounded-xl transition-colors flex items-center gap-2.5 text-xs font-semibold ${
+              isActive('/tasks')
+                ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30'
+                : 'text-slate-300 hover:text-white hover:bg-slate-800/60'
+            }`}
+          >
+            <Sparkles className="w-4 h-4 text-cyan-400" />
+            <span>Workflows</span>
+          </Link>
+
+          <Link
+            to="/settings"
+            onClick={() => setMobileMenuOpen(false)}
+            className={`w-full px-3 py-2.5 rounded-xl transition-colors flex items-center gap-2.5 text-xs font-semibold ${
+              isActive('/settings')
+                ? 'bg-cyan-500/15 text-cyan-400 border border-cyan-500/30'
+                : 'text-slate-300 hover:text-white hover:bg-slate-800/60'
+            }`}
+          >
+            <Sliders className="w-4 h-4 text-cyan-400" />
+            <span>Diagnostics</span>
+          </Link>
+
+          <div className="pt-2 mt-2 border-t border-slate-800/80 flex items-center justify-between text-[11px] font-mono text-slate-400 px-1">
+            <span className="flex items-center gap-1 text-blue-300">
+              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+              PayPal Sandbox Ready
+            </span>
+            <span className="text-slate-500">v1.0.0</span>
+          </div>
+        </nav>
+      )}
     </header>
   );
 };
